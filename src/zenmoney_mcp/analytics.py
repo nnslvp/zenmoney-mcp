@@ -1998,10 +1998,21 @@ def detect_anomalies(
     conn = db.connect()
     start_date, end_date = get_period_dates(period)
 
+    # Get user currency for conversion
+    user_currency_id = db.get_user_currency()
+    if not user_currency_id:
+        user_currency_id = 2  # Default to RUB
+    currency_row = conn.execute(
+        "SELECT short_title, rate FROM instruments WHERE id = ?",
+        (user_currency_id,)
+    ).fetchone()
+    currency_code = currency_row["short_title"] if currency_row else "RUB"
+    user_rate = currency_row["rate"] if currency_row else 1.0
+
     # Build query with optional category filter
     query = """
         SELECT
-            t.id, t.date, t.outcome, t.tag, t.merchant, t.payee,
+            t.id, t.date, t.outcome, t.outcome_instrument, t.tag, t.merchant, t.payee,
             t.comment,
             m.title as merchant_title,
             tag.title as tag_title
@@ -2049,7 +2060,12 @@ def detect_anomalies(
 
         if category not in category_stats:
             category_stats[category] = []
-        category_stats[category].append(row["outcome"])
+        amount = row["outcome"]
+        instrument_id = row["outcome_instrument"]
+        if instrument_id and instrument_id != user_currency_id:
+            source_rate = db.get_instrument_rate(instrument_id)
+            amount = amount * source_rate / user_rate if user_rate else amount
+        category_stats[category].append(amount)
 
     # Calculate stats for each category
     for category, amounts in category_stats.items():
@@ -2078,12 +2094,18 @@ def detect_anomalies(
             if row_category != category:
                 continue
 
-            z_score = abs(row["outcome"] - mean) / stddev
+            amount = row["outcome"]
+            instrument_id = row["outcome_instrument"]
+            if instrument_id and instrument_id != user_currency_id:
+                source_rate = db.get_instrument_rate(instrument_id)
+                amount = amount * source_rate / user_rate if user_rate else amount
+
+            z_score = abs(amount - mean) / stddev
             if z_score > z_threshold:
                 outliers.append({
                     "transaction_id": row["id"],
                     "date": row["date"],
-                    "amount": round(row["outcome"], 2),
+                    "amount": round(amount, 2),
                     "category": row["tag_title"] or "Uncategorized",
                     "payee": row["merchant_title"] or row["payee"],
                     "z_score": round(z_score, 2),
@@ -2101,8 +2123,21 @@ def detect_anomalies(
                 continue
             checked_pairs.add(pair_key)
 
+            # Convert amounts to user currency for comparison
+            amount1 = row1["outcome"]
+            instr1 = row1["outcome_instrument"]
+            if instr1 and instr1 != user_currency_id:
+                source_rate = db.get_instrument_rate(instr1)
+                amount1 = amount1 * source_rate / user_rate if user_rate else amount1
+
+            amount2 = row2["outcome"]
+            instr2 = row2["outcome_instrument"]
+            if instr2 and instr2 != user_currency_id:
+                source_rate = db.get_instrument_rate(instr2)
+                amount2 = amount2 * source_rate / user_rate if user_rate else amount2
+
             # Check if amounts are close
-            if abs(row1["outcome"] - row2["outcome"]) < 0.01:
+            if abs(amount1 - amount2) < 0.01:
                 # Check if dates are close
                 date1 = date.fromisoformat(row1["date"])
                 date2 = date.fromisoformat(row2["date"])
@@ -2114,13 +2149,14 @@ def detect_anomalies(
                         duplicates.append({
                             "transactions": [row1["id"], row2["id"]],
                             "date": row1["date"],
-                            "amount": round(row1["outcome"], 2),
+                            "amount": round(amount1, 2),
                             "payee": payee1,
                             "severity": "medium",
                         })
 
     return {
         "period": {"start": start_date, "end": end_date},
+        "currency": currency_code,
         "summary": {
             "outliers_count": len(outliers),
             "duplicates_count": len(duplicates),

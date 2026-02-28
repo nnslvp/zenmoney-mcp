@@ -1144,6 +1144,123 @@ class TestT10DetectAnomalies:
             assert "amount" in dup
 
 
+    def test_detect_anomalies_currency_field(self, populated_db: Database):
+        """Test that currency field is present in response."""
+        result = detect_anomalies(populated_db, period="this_month")
+        assert "currency" in result
+        assert result["currency"] == "RUB"
+
+    def test_detect_anomalies_multicurrency_conversion(self, populated_db: Database):
+        """Test that amounts in different currencies are converted before z-score calculation."""
+        conn = populated_db.connect()
+        today = date.today()
+        current_month_start = today.replace(day=1)
+
+        # Insert several RUB transactions in grocery category with similar amounts
+        for i in range(5):
+            conn.execute(
+                """INSERT INTO transactions
+                (id, date, user, deleted, hold, income, income_instrument, income_account,
+                 outcome, outcome_instrument, outcome_account, tag, merchant, payee,
+                 original_payee, comment, mcc, op_income, op_income_instrument,
+                 op_outcome, op_outcome_instrument, latitude, longitude,
+                 reminder_marker, created, changed)
+                VALUES (?, ?, 1, 0, 0, 0.0, 1, 'acc-rub', ?, 1, 'acc-rub',
+                        ?, 'm-pyat', 'Пятёрочка', NULL, NULL, 5411, NULL, NULL,
+                        NULL, NULL, NULL, NULL, NULL, 1000000, ?)""",
+                (
+                    f"tx-mc-rub-{i}",
+                    (current_month_start + __import__("datetime").timedelta(days=i)).isoformat(),
+                    1500.0 + i * 10,  # ~1500 RUB each
+                    json.dumps(["tag-grocery"]),
+                    1000100 + i,
+                ),
+            )
+
+        # Insert a USD transaction: $17 in the same category
+        # With rate=90, $17 = 1530 RUB — close to the mean, NOT an outlier
+        conn.execute(
+            """INSERT INTO transactions
+            (id, date, user, deleted, hold, income, income_instrument, income_account,
+             outcome, outcome_instrument, outcome_account, tag, merchant, payee,
+             original_payee, comment, mcc, op_income, op_income_instrument,
+             op_outcome, op_outcome_instrument, latitude, longitude,
+             reminder_marker, created, changed)
+            VALUES ('tx-mc-usd', ?, 1, 0, 0, 0.0, 2, 'acc-usd', 17.0, 2, 'acc-usd',
+                    ?, 'm-pyat', 'Пятёрочка', NULL, NULL, 5411, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, 1000000, 1000200)""",
+            (
+                (current_month_start + __import__("datetime").timedelta(days=6)).isoformat(),
+                json.dumps(["tag-grocery"]),
+            ),
+        )
+        conn.commit()
+
+        result = detect_anomalies(populated_db, period="this_month", z_threshold=1.5)
+
+        # The $17 transaction (=1530 RUB converted) should NOT be an outlier
+        # because it's close to ~1520 RUB mean after conversion.
+        # Without conversion, raw 17.0 would be a huge outlier vs 1500 RUB values.
+        usd_outlier = [
+            o for o in result["outliers"]
+            if o["transaction_id"] == "tx-mc-usd"
+        ]
+        assert len(usd_outlier) == 0, (
+            f"USD transaction should not be an outlier after conversion, "
+            f"but was detected with z_score={usd_outlier[0]['z_score'] if usd_outlier else 'N/A'}"
+        )
+
+    def test_detect_anomalies_duplicates_converted_amounts(self, populated_db: Database):
+        """Test that duplicate detection uses converted amounts."""
+        conn = populated_db.connect()
+        today = date.today()
+        current_month_start = today.replace(day=1)
+        tx_date = (current_month_start + __import__("datetime").timedelta(days=10)).isoformat()
+
+        # Transaction 1: 900 RUB at Пятёрочка
+        conn.execute(
+            """INSERT INTO transactions
+            (id, date, user, deleted, hold, income, income_instrument, income_account,
+             outcome, outcome_instrument, outcome_account, tag, merchant, payee,
+             original_payee, comment, mcc, op_income, op_income_instrument,
+             op_outcome, op_outcome_instrument, latitude, longitude,
+             reminder_marker, created, changed)
+            VALUES ('tx-dup-rub', ?, 1, 0, 0, 0.0, 1, 'acc-rub', 900.0, 1, 'acc-rub',
+                    ?, 'm-pyat', 'Пятёрочка', NULL, NULL, 5411, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, 1000000, 1000300)""",
+            (tx_date, json.dumps(["tag-grocery"])),
+        )
+
+        # Transaction 2: $10 at Пятёрочка on the same day
+        # With rate=90, $10 = 900 RUB — same converted amount
+        conn.execute(
+            """INSERT INTO transactions
+            (id, date, user, deleted, hold, income, income_instrument, income_account,
+             outcome, outcome_instrument, outcome_account, tag, merchant, payee,
+             original_payee, comment, mcc, op_income, op_income_instrument,
+             op_outcome, op_outcome_instrument, latitude, longitude,
+             reminder_marker, created, changed)
+            VALUES ('tx-dup-usd', ?, 1, 0, 0, 0.0, 2, 'acc-usd', 10.0, 2, 'acc-usd',
+                    ?, 'm-pyat', 'Пятёрочка', NULL, NULL, 5411, NULL, NULL,
+                    NULL, NULL, NULL, NULL, NULL, 1000000, 1000301)""",
+            (tx_date, json.dumps(["tag-grocery"])),
+        )
+        conn.commit()
+
+        result = detect_anomalies(populated_db, period="this_month")
+
+        # These should be detected as duplicates since converted amounts match
+        dup = [
+            d for d in result["possible_duplicates"]
+            if set(d["transactions"]) == {"tx-dup-rub", "tx-dup-usd"}
+        ]
+        assert len(dup) == 1, (
+            f"Expected duplicate pair (tx-dup-rub, tx-dup-usd) with converted amounts, "
+            f"found duplicates: {result['possible_duplicates']}"
+        )
+        assert dup[0]["amount"] == 900.0
+
+
 class TestT11GetDebts:
     """Test T11: get_debts tool."""
 
