@@ -1620,8 +1620,8 @@ class TestT17GetExchangeRates:
         assert cross["EUR"]["USD"] == pytest.approx(100 / 90, abs=0.0001)
 
     def test_rates_has_user_currency(self, populated_db: Database):
-        # Set user_currency metadata
-        populated_db.set_meta("user_currency", "1")  # RUB
+        # User currency must be resolved from the users table (currency=RUB in the
+        # fixture), NOT from a sync_meta key that real sync never writes.
         result = get_exchange_rates(populated_db, currencies=["USD", "EUR"])
         assert result["user_currency"] == "RUB"
 
@@ -2161,3 +2161,122 @@ class TestSpendingDrillDown:
             assert "amount" in merchant
             assert "count" in merchant
             assert "share_pct" in merchant
+
+
+# ============================================================================
+# Audit-confirmed fixes (TDD)
+# ============================================================================
+
+from zenmoney_mcp import analytics as _analytics  # noqa: E402
+
+_TX_COLS = (
+    "id, date, user, deleted, hold, income, income_instrument, income_account, "
+    "outcome, outcome_instrument, outcome_account, tag, merchant, payee, "
+    "original_payee, comment, mcc, op_income, op_income_instrument, op_outcome, "
+    "op_outcome_instrument, latitude, longitude, reminder_marker, created, changed"
+)
+
+
+def _insert_tx(db, **kw):
+    """Insert a transaction with sensible defaults; override via kwargs."""
+    defaults = dict(
+        id="x", date=date.today().isoformat(), user=1, deleted=0, hold=0,
+        income=0.0, income_instrument=1, income_account="acc-rub",
+        outcome=0.0, outcome_instrument=1, outcome_account="acc-rub",
+        tag=None, merchant=None, payee=None, original_payee=None, comment=None,
+        mcc=None, op_income=None, op_income_instrument=None, op_outcome=None,
+        op_outcome_instrument=None, latitude=None, longitude=None,
+        reminder_marker=None, created=1000000, changed=1000000,
+    )
+    defaults.update(kw)
+    cols = _TX_COLS.split(", ")
+    placeholders = ", ".join("?" for _ in cols)
+    db.connect().execute(
+        f"INSERT INTO transactions ({_TX_COLS}) VALUES ({placeholders})",
+        [defaults[c] for c in cols],
+    )
+    db.connect().commit()
+
+
+class TestAuditFixConvertCurrencyUserCurrency:
+    """F2: convert_currency must resolve user currency from the users table."""
+
+    def test_convert_includes_user_currency_context(self, populated_db: Database):
+        # User currency is RUB; converting USD->EUR (neither is RUB) must add context.
+        result = convert_currency(populated_db, amount=100, from_currency="USD", to_currency="EUR")
+        assert "in_user_currency" in result
+        assert result["in_user_currency"]["currency"] == "RUB"
+        # 100 USD * 90 / 1 = 9000 RUB
+        assert result["in_user_currency"]["amount"] == pytest.approx(9000.0, abs=0.01)
+
+
+class TestAuditFixIncomeHoldFilter:
+    """F3: analyze_income must exclude held (pending) income."""
+
+    def test_analyze_income_excludes_held(self, populated_db: Database):
+        _insert_tx(populated_db, id="held-income", hold=1, income=99999.0,
+                   income_account="acc-rub", outcome=0.0, tag=json.dumps(["tag-salary"]))
+        result = analyze_income(populated_db, period="this_month")
+        # Only tx5 (150000) counts; the held 99999 must be excluded.
+        assert result["total_income"] == 150000.0
+
+
+class TestAuditFixTrendsIncomeHoldFilter:
+    """F4: analyze_trends income metric must exclude held income."""
+
+    def test_trends_income_excludes_held(self, populated_db: Database):
+        _insert_tx(populated_db, id="held-income2", hold=1, income=88888.0,
+                   income_account="acc-rub", outcome=0.0)
+        result = analyze_trends(populated_db, months=1, metric="income")
+        current = result["data"][-1]
+        assert current["value"] == 150000.0
+
+
+class TestAuditFixBudgetResourceBudgetMonth:
+    """F5: get_current_budgets_resource must respect month_start_day, like check_budget_health."""
+
+    def test_resource_uses_budget_month_not_calendar(self, monkeypatch):
+        class _FixedDate(date):
+            @classmethod
+            def today(cls):
+                return date(2026, 6, 5)  # before the 8th
+
+        db = Database(":memory:")
+        db.init_schema()
+        conn = db.connect()
+        conn.execute(
+            "INSERT INTO users (id, login, currency, parent, month_start_day, changed) VALUES (?,?,?,?,?,?)",
+            (1, "u@test", 1, None, 8, 1000000),
+        )
+        conn.execute("INSERT INTO instruments (id, title, short_title, symbol, rate, changed) VALUES (1,'RUB','RUB','₽',1.0,1)")
+        conn.execute("INSERT INTO tags (id, title, parent, show_income, show_outcome, budget_income, budget_outcome, required, user, changed) VALUES ('t-may','MayCat',NULL,0,1,0,1,0,1,1)")
+        conn.execute("INSERT INTO tags (id, title, parent, show_income, show_outcome, budget_income, budget_outcome, required, user, changed) VALUES ('t-jun','JunCat',NULL,0,1,0,1,0,1,1)")
+        # Budget month for 2026-06-05 with month_start_day=8 is MAY (period 2026-05-08..2026-06-07).
+        conn.execute("INSERT INTO budgets (user, tag, date, income, income_lock, outcome, outcome_lock, changed) VALUES (1,'t-may','2026-05-01',0,0,500.0,1,1)")
+        conn.execute("INSERT INTO budgets (user, tag, date, income, income_lock, outcome, outcome_lock, changed) VALUES (1,'t-jun','2026-06-01',0,0,900.0,1,1)")
+        conn.commit()
+
+        monkeypatch.setattr(_analytics, "date", _FixedDate)
+        result = get_current_budgets_resource(db)
+
+        assert result["month"] == "2026-05"
+        tags = {b["tag_id"] for b in result["budgets"]}
+        assert "t-may" in tags
+        assert "t-jun" not in tags
+
+
+class TestAuditFixSearchAmountCurrency:
+    """F7: search_transactions amount filters must compare in the user's currency."""
+
+    def test_amount_filter_converts_currency(self, populated_db: Database):
+        # 100 USD expense = 9000 RUB (user currency). Threshold is in user currency.
+        _insert_tx(populated_db, id="usd-exp", outcome=100.0, outcome_instrument=2,
+                   outcome_account="acc-usd", income=0.0, payee="USDTEST")
+
+        # min 5000 RUB -> 9000 >= 5000, included.
+        inc = search_transactions(populated_db, payee_search="USDTEST", min_amount=5000)
+        assert inc["returned_count"] == 1
+
+        # max 5000 RUB -> 9000 > 5000, excluded.
+        exc = search_transactions(populated_db, payee_search="USDTEST", max_amount=5000)
+        assert exc["returned_count"] == 0

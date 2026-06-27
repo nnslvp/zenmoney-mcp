@@ -70,6 +70,7 @@ def classify_transaction(
         income_account_id = tx.get("income_account") or tx.get("incomeAccount")
         outcome_account_id = tx.get("outcome_account") or tx.get("outcomeAccount")
 
+        # Debt operations take priority (they require account-type info).
         if accounts:
             income_acc = accounts.get(income_account_id, {})
             outcome_acc = accounts.get(outcome_account_id, {})
@@ -77,18 +78,16 @@ def classify_transaction(
             income_is_debt = income_acc.get("type") == "debt"
             outcome_is_debt = outcome_acc.get("type") == "debt"
 
-            # Debt operations
             if income_is_debt and not outcome_is_debt:
                 return "debt_out"  # Gave money to debt account (lent money)
             if outcome_is_debt and not income_is_debt:
                 return "debt_in"  # Took money from debt account (borrowed)
 
-            # Check for currency exchange
-            income_instrument = tx.get("income_instrument") or tx.get("incomeInstrument")
-            outcome_instrument = tx.get("outcome_instrument") or tx.get("outcomeInstrument")
-
-            if income_instrument != outcome_instrument:
-                return "exchange"
+        # Currency exchange depends only on the instruments, not the accounts dict.
+        income_instrument = tx.get("income_instrument") or tx.get("incomeInstrument")
+        outcome_instrument = tx.get("outcome_instrument") or tx.get("outcomeInstrument")
+        if income_instrument != outcome_instrument:
+            return "exchange"
 
         return "transfer"
 

@@ -629,6 +629,7 @@ def analyze_income(
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.income_account
         WHERE t.deleted = 0
+          AND (t.hold IS NULL OR t.hold = 0)
           AND t.date BETWEEN ? AND ?
           AND t.income > 0
           AND t.outcome = 0
@@ -1639,6 +1640,7 @@ def analyze_trends(
                 FROM transactions t
                 LEFT JOIN accounts a ON a.id = t.income_account
                 WHERE t.deleted = 0
+                  AND (t.hold IS NULL OR t.hold = 0)
                   AND t.income > 0
                   AND t.outcome = 0
                   AND t.date >= ? AND t.date <= ?
@@ -2735,14 +2737,33 @@ def search_transactions(
         )"""
         params.extend([search_pattern] * 4)
 
-    # Amount filters
+    # Amount filters — compare in the user's currency so thresholds are meaningful
+    # across multi-currency accounts. Transaction amounts are stored in each
+    # account's own currency; convert via amount * instrument.rate / user_rate.
+    # COALESCE(rate, user_rate) makes a missing rate fall back to the raw amount.
+    user_rate = db.get_instrument_rate(user_currency_id) if user_currency_id else 0
     if min_amount is not None:
-        query += " AND (t.outcome >= ? OR t.income >= ?)"
-        params.extend([min_amount, min_amount])
+        if user_rate:
+            query += (
+                " AND ( (t.outcome > 0 AND t.outcome * COALESCE(oi.rate, ?) / ? >= ?)"
+                " OR (t.income > 0 AND t.income * COALESCE(ii.rate, ?) / ? >= ?) )"
+            )
+            params.extend([user_rate, user_rate, min_amount, user_rate, user_rate, min_amount])
+        else:
+            query += " AND (t.outcome >= ? OR t.income >= ?)"
+            params.extend([min_amount, min_amount])
 
     if max_amount is not None:
-        query += " AND (t.outcome <= ? OR t.income <= ? OR (t.outcome = 0 AND t.income = 0))"
-        params.extend([max_amount, max_amount])
+        if user_rate:
+            query += (
+                " AND ( (t.outcome > 0 AND t.outcome * COALESCE(oi.rate, ?) / ? <= ?)"
+                " OR (t.income > 0 AND t.income * COALESCE(ii.rate, ?) / ? <= ?)"
+                " OR (t.outcome = 0 AND t.income = 0) )"
+            )
+            params.extend([user_rate, user_rate, max_amount, user_rate, user_rate, max_amount])
+        else:
+            query += " AND (t.outcome <= ? OR t.income <= ? OR (t.outcome = 0 AND t.income = 0))"
+            params.extend([max_amount, max_amount])
 
     # Type filter
     if tx_type == "income":
@@ -2947,9 +2968,13 @@ def get_current_budgets_resource(db: Database) -> dict[str, Any]:
     """R3: Get current month budgets for LLM context."""
     conn = db.connect()
 
-    # Current month first day
+    # Resolve the user's current BUDGET month (respects month_start_day), matching
+    # check_budget_health. Using the calendar month would return the wrong budget
+    # near the month boundary when month_start_day != 1.
     today = date.today()
-    month_start = today.replace(day=1).isoformat()
+    month_start_day = db.get_user_month_start_day()
+    target_year, target_month = _current_budget_month(month_start_day, today)
+    budget_date = date(target_year, target_month, 1).isoformat()
 
     rows = conn.execute("""
         SELECT b.tag, b.outcome, b.outcome_lock, b.income, b.income_lock,
@@ -2958,7 +2983,7 @@ def get_current_budgets_resource(db: Database) -> dict[str, Any]:
         LEFT JOIN tags t ON t.id = b.tag
         WHERE b.date = ?
         ORDER BY b.outcome DESC
-    """, (month_start,)).fetchall()
+    """, (budget_date,)).fetchall()
 
     budgets = []
     for row in rows:
@@ -2981,7 +3006,7 @@ def get_current_budgets_resource(db: Database) -> dict[str, Any]:
         })
 
     return {
-        "month": today.strftime("%Y-%m"),
+        "month": f"{target_year:04d}-{target_month:02d}",
         "budgets": budgets,
     }
 
@@ -3082,7 +3107,7 @@ def convert_currency(
     converted = round(amount * cross_rate, 2)
 
     # Also get user currency for context
-    user_currency_id = db.get_meta("user_currency")
+    user_currency_id = db.get_user_currency()
     user_row = None
     if user_currency_id:
         user_row = conn.execute(
@@ -3158,7 +3183,7 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
     instr_map = {r["short_title"]: r for r in instruments}
 
     # Get user currency
-    user_currency_id = db.get_meta("user_currency")
+    user_currency_id = db.get_user_currency()
     user_code = None
     if user_currency_id:
         user_row = conn.execute(

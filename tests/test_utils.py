@@ -118,6 +118,29 @@ class TestTransactionClassification:
         tx = {"income": 1000, "outcome": 1000}
         assert classify_transaction(tx) == "transfer"
 
+    def test_classify_exchange_without_accounts(self):
+        """A currency exchange must be detected from instruments alone, even without accounts."""
+        tx = {
+            "income": 100,
+            "outcome": 9000,
+            "incomeInstrument": 2,  # USD
+            "outcomeInstrument": 1,  # RUB
+        }
+        assert classify_transaction(tx) == "exchange"
+
+    def test_classify_debt_takes_priority_over_exchange(self):
+        """A cross-currency debt operation is still classified as debt, not exchange."""
+        tx = {
+            "income": 100,
+            "outcome": 9000,
+            "incomeAccount": "acc-debt",
+            "outcomeAccount": "acc-rub",
+            "incomeInstrument": 2,  # USD
+            "outcomeInstrument": 1,  # RUB
+        }
+        accounts = {"acc-debt": {"type": "debt"}, "acc-rub": {"type": "ccard"}}
+        assert classify_transaction(tx, accounts) == "debt_out"
+
 
 class TestTransactionPredicates:
     """Test transaction predicate functions."""
