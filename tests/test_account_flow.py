@@ -10,7 +10,7 @@ from zenmoney_mcp import server as zm_server
 from zenmoney_mcp.analytics import get_account_flow, get_period_dates
 from zenmoney_mcp.database import Database
 
-from .factories import insert_account, insert_instrument, insert_transaction
+from .factories import insert_account, insert_instrument, insert_tag, insert_transaction
 
 ACCOUNT = "acc-flow"
 OTHER = "acc-save"
@@ -237,3 +237,33 @@ class TestPeriod:
 
         assert not result.isError, result.content[0].text
         assert json.loads(result.content[0].text)["period"]["start"] == date.today().replace(day=1).isoformat()
+
+
+class TestAccountFlowCategoriesAndCounterparties:
+    def test_income_and_expense_of_one_category_are_separate_lines(self, populated_db):
+        """A refund on a category must not be added to the spending in it."""
+        tag = insert_tag(populated_db, title="Clothes")
+        insert_transaction(populated_db, outcome=300.0, tag=[tag["id"]], payee="Shop")
+        insert_transaction(populated_db, income=100.0, tag=[tag["id"]], payee="Shop")
+
+        lines = {
+            (line["category"], line["type"]): line["total"]
+            for line in get_account_flow(populated_db, "acc-rub")["summary"]["by_category"]
+        }
+
+        assert lines[("Clothes", "outcome")] == 300.0
+        assert lines[("Clothes", "income")] == 100.0
+
+    def test_counterparty_of_a_payment_is_the_payee_not_the_account(self, populated_db):
+        tx = insert_transaction(populated_db, outcome=42.0, payee="Bakery")
+
+        row = next(
+            t for t in get_account_flow(populated_db, "acc-rub")["transactions"] if t["id"] == tx["id"]
+        )
+
+        assert row["counterparty"] == "Bakery"
+
+    def test_counterparty_of_a_transfer_is_the_other_account(self, populated_db):
+        rows = {t["id"]: t for t in get_account_flow(populated_db, "acc-rub")["transactions"]}
+
+        assert rows["tx6"]["counterparty"] == "Накопительный Сбер"

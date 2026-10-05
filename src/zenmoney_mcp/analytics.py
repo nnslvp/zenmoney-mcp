@@ -3383,11 +3383,12 @@ def get_account_flow(
 
         # Category aggregation (only for income/outcome, not transfers)
         if tx_type in ["income", "outcome"] and not on_hold:
+            # Income and spending in one category are separate lines (a refund
+            # on a category is not more spending in it)
             category = row["tag_title"] or "Uncategorized"
-            if category not in by_category_map:
-                by_category_map[category] = {"type": tx_type, "total": 0.0, "count": 0}
-            by_category_map[category]["total"] += amount
-            by_category_map[category]["count"] += 1
+            line = by_category_map.setdefault((category, tx_type), {"total": 0.0, "count": 0})
+            line["total"] += amount
+            line["count"] += 1
 
         # Transaction list
         transaction = {
@@ -3398,8 +3399,10 @@ def get_account_flow(
             "category": row["tag_title"],
             "payee": row["merchant_title"] or row["payee"],
             "comment": row["comment"],
+            # The other side: the payee of a payment, the other account of a transfer
             "counterparty": (
-                row["outcome_account_title"] if tx_type in ["transfer_in", "income"]
+                row["merchant_title"] or row["payee"] if tx_type in ["income", "outcome"]
+                else row["outcome_account_title"] if tx_type == "transfer_in"
                 else row["income_account_title"]
             ),
             "hold": on_hold,
@@ -3437,11 +3440,11 @@ def get_account_flow(
     by_category = [
         {
             "category": cat,
-            "type": stats["type"],
+            "type": tx_type,
             "total": round(stats["total"], 2),
             "count": stats["count"],
         }
-        for cat, stats in by_category_map.items()
+        for (cat, tx_type), stats in by_category_map.items()
     ]
     by_category.sort(key=lambda x: x["total"], reverse=True)
 

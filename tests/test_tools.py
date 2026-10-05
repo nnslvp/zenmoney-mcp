@@ -2162,7 +2162,8 @@ class TestRecurringDedup:
 
         # Insert repeated transactions to be detected as recurring
         for i in range(3):
-            month_start = date(today.year, today.month - 2 + i, 1) if today.month > 2 else date(today.year - 1, today.month + 10 + i, 1)
+            year, month_index = divmod(today.year * 12 + today.month - 1 - 2 + i, 12)
+            month_start = date(year, month_index + 1, 1)
             conn.execute(
                 """INSERT INTO transactions
                 (id, date, user, deleted, hold, income, income_instrument, income_account,
