@@ -339,14 +339,16 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_upcoming_payments",
-            description="Get upcoming payments from reminders. Answers: 'What payments are coming up?', 'What bills are due?'",
+            description="Get planned payments and incomes from reminders for the next days_ahead days. Transfers between own accounts are listed separately ('transfers') and are not part of the income/outcome totals. 'overdue' lists items still planned although their date passed within the last 30 days. Amounts and totals are in the user's currency; each item keeps original_amount/original_currency. Answers: 'What payments are coming up?', 'What bills are due?'",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "days_ahead": {
                         "type": "integer",
-                        "description": "Planning horizon in days",
+                        "description": "Planning horizon in days (0-3650)",
                         "default": 30,
+                        "minimum": 0,
+                        "maximum": 3650,
                     },
                 },
             },
@@ -383,19 +385,22 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="detect_recurring",
-            description="Detect recurring payments (subscriptions, bills). Answers: 'What subscriptions do I have?', 'What can I cancel?'",
+            description="Detect recurring payments (subscriptions, bills): repeating reminders plus patterns found in past expenses on all accounts. Amounts and totals are in the user's currency; each item keeps original_amount/original_currency. Totals count active items only; patterns whose payments stopped are listed in 'ended'. Answers: 'What subscriptions do I have?', 'What can I cancel?'",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "lookback_months": {
                         "type": "integer",
-                        "description": "Analysis depth in months",
+                        "description": "Months of history to search for patterns (1-120)",
                         "default": 3,
+                        "minimum": 1,
+                        "maximum": 120,
                     },
                     "tolerance_pct": {
-                        "type": "integer",
+                        "type": "number",
                         "description": "Amount variation tolerance in %",
                         "default": 10,
+                        "minimum": 0,
                     },
                 },
             },
@@ -448,7 +453,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="detect_anomalies",
-            description="Detect anomalous spending (outliers, suspicious duplicates). Answers: 'Any unusual spending?', 'Suspicious transactions?'. Severity: z>=3.0 high, z>=2.0 medium, else low. Minimum z_threshold is 1.5.",
+            description="Detect anomalous spending: outliers (payments far ABOVE their category's average, strongest first) and possible duplicates (groups of payments with the same payee and amount within a day, largest first). Each list is cut to 15; summary has the total and returned counts. Answers: 'Any unusual spending?', 'Suspicious transactions?'. Severity: z>=3.0 high, z>=2.0 medium, else low. Minimum z_threshold is 1.5.",
             inputSchema={
                 "type": "object",
                 "properties": {

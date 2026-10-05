@@ -2151,8 +2151,8 @@ class TestRecurringDedup:
         netflix = next((r for r in reminder_items if r["name"] == "Netflix"), None)
         assert netflix is not None
         assert "yearly_cost" in netflix
-        # monthly: 500 * (365/30) ≈ 6083.33
-        assert netflix["yearly_cost"] == pytest.approx(500 * 365 / 30, abs=1.0)
+        # monthly: 12 payments a year
+        assert netflix["yearly_cost"] == 500 * 12
 
     def test_dedup_skips_detected_names(self, populated_db: Database):
         """ISSUE-005: Reminders with names already detected should be skipped."""

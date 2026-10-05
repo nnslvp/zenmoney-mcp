@@ -1824,10 +1824,73 @@ def analyze_merchants(
     }
 
 
+# Payments per year for each recurring frequency
+_PAYMENTS_PER_YEAR = {"daily": 365, "weekly": 52, "biweekly": 26, "monthly": 12, "quarterly": 4, "yearly": 1}
+
+# Reminder.interval -> frequency of a reminder with step 1
+_REMINDER_FREQUENCY = {"day": "daily", "week": "weekly", "month": "monthly", "year": "yearly"}
+
+# Word stems in a category title that tell the type of a recurring payment
+_RECURRING_TYPE_STEMS = {
+    "subscription": ("подписк", "subscri", "сервис"),
+    "utility": ("жкх", "коммунал", "utilit"),
+    "loan": ("кредит", "loan"),
+    "insurance": ("страхов", "insur"),
+}
+
+
+def _recurring_type(category: str | None) -> str:
+    """Classify a recurring payment by its category title."""
+    title = (category or "").lower()
+    for payment_type, stems in _RECURRING_TYPE_STEMS.items():
+        if any(stem in title for stem in stems):
+            return payment_type
+    return "other"
+
+
+def _first_text(*candidates: str | None) -> str | None:
+    """Return the first non-blank string (stripped), or None."""
+    for candidate in candidates:
+        if candidate and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _median(values: list[float]) -> float:
+    """Return the median of a non-empty list."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _amounts_close(a: float, b: float, tolerance_pct: float) -> bool:
+    """Whether two amounts differ by no more than tolerance_pct of the larger one."""
+    return abs(a - b) <= max(a, b) * tolerance_pct / 100
+
+
+def _is_same_recurring_payment(reminder: dict[str, Any], pattern: dict[str, Any], tolerance_pct: float) -> bool:
+    """Whether a reminder and a pattern detected in transactions describe one payment.
+
+    They do when the payments were created from the reminder itself, or when the
+    amounts are similar and the merchant, the payee or (if one side names nobody)
+    the category is the same. Display names are never compared: many unrelated
+    payments have no payee at all.
+    """
+    if reminder["id"] in pattern["reminder_ids"]:
+        return True
+    if not _amounts_close(reminder["amount"], pattern["amount"], tolerance_pct):
+        return False
+    if reminder["merchant_id"] and reminder["merchant_id"] == pattern["merchant_id"]:
+        return True
+    if reminder["payee"] and pattern["payee"]:
+        return reminder["payee"].lower() == pattern["payee"].lower()
+    return reminder["tag_id"] == pattern["tag_id"]
+
+
 def detect_recurring(
     db: Database,
     lookback_months: int = 3,
-    tolerance_pct: int = 10,
+    tolerance_pct: float = 10,
 ) -> dict[str, Any]:
     """Detect recurring payments (subscriptions, regular bills).
 
@@ -1835,12 +1898,22 @@ def detect_recurring(
 
     Args:
         db: Database instance.
-        lookback_months: Number of months to analyze (default 3).
+        lookback_months: Number of months of history to analyze (default 3).
         tolerance_pct: Tolerance for amount variation in % (default 10).
 
     Returns:
-        Dictionary with detected recurring payments.
+        Dictionary with active recurring payments (repeating reminders plus patterns
+        detected in the history), their monthly/yearly totals in the user's currency,
+        and a short list of patterns that ended.
+
+    Raises:
+        ValueError: If lookback_months or tolerance_pct is out of range.
     """
+    if not isinstance(lookback_months, int) or not 1 <= lookback_months <= 120:
+        raise ValueError(f"lookback_months must be a whole number from 1 to 120, got {lookback_months!r}")
+    if not isinstance(tolerance_pct, (int, float)) or tolerance_pct < 0:
+        raise ValueError(f"tolerance_pct must be a non-negative number, got {tolerance_pct!r}")
+
     conn = db.connect()
 
     # Get user currency
@@ -1859,23 +1932,30 @@ def detect_recurring(
     today = date.today()
     start_date = today - timedelta(days=lookback_months * 30)
 
-    # Query expense transactions
+    # Query expense transactions on every account: a subscription paid from an
+    # off-balance account is still a subscription
     rows = conn.execute("""
         SELECT
             t.id, t.date, t.outcome, t.outcome_instrument, t.outcome_account,
-            t.merchant, t.payee, t.tag, t.mcc,
+            t.merchant, t.payee, t.comment,
+            json_extract(t.tag, '$[0]') as tag_id,
             m.title as merchant_title,
-            a.title as account_title
+            tag.title as tag_title,
+            a.title as account_title,
+            i.short_title as currency, i.rate,
+            rm.reminder as reminder_id
         FROM transactions t
         LEFT JOIN merchants m ON m.id = t.merchant
+        LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
         LEFT JOIN accounts a ON a.id = t.outcome_account
+        LEFT JOIN instruments i ON i.id = t.outcome_instrument
+        LEFT JOIN reminder_markers rm ON rm.id = t.reminder_marker
         WHERE t.deleted = 0
           AND (t.hold IS NULL OR t.hold = 0)
           AND NOT (t.income > 0 AND t.outcome > 0)
           AND t.outcome > 0
           AND t.income = 0
           AND t.date >= ?
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
         ORDER BY t.date ASC
     """, (start_date.isoformat(),)).fetchall()
 
@@ -1884,25 +1964,14 @@ def detect_recurring(
     for row in rows:
         # Convert to user currency
         amount = row["outcome"]
-        instrument_id = row["outcome_instrument"]
-        if instrument_id and instrument_id != user_currency_id:
-            source_rate = db.get_instrument_rate(instrument_id)
-            converted_amount = amount * source_rate / user_rate if user_rate else amount
+        if row["rate"] and user_rate and row["outcome_instrument"] != user_currency_id:
+            converted_amount = amount * row["rate"] / user_rate
         else:
             converted_amount = amount
 
-        # Group key
-        payee_key = row["merchant_title"] or row["payee"] or "unknown"
-        tag_json = row["tag"]
-        if tag_json:
-            try:
-                tags = json.loads(tag_json)
-                tag_key = tags[0] if tags else None
-            except (json.JSONDecodeError, IndexError):
-                tag_key = None
-        else:
-            tag_key = None
-
+        # Group key (payee_key is None for payments without a payee)
+        payee_key = _first_text(row["merchant_title"], row["payee"])
+        tag_key = row["tag_id"]
         account_key = row["outcome_account"]
 
         # Round amount to nearest 100 for grouping (tolerance for minor variations)
@@ -1915,20 +1984,30 @@ def detect_recurring(
                 "payee": payee_key,
                 "merchant_id": row["merchant"],
                 "tag": tag_key,
+                "tag_title": row["tag_title"],
                 "account": account_key,
                 "account_title": row["account_title"],
-                "mcc": row["mcc"],
+                "comment": None,
+                "reminder_ids": set(),
                 "transactions": [],
             }
+
+        # Rows come oldest first, so the latest comment wins
+        groups[group_key]["comment"] = _first_text(row["comment"]) or groups[group_key]["comment"]
+        if row["reminder_id"]:
+            groups[group_key]["reminder_ids"].add(row["reminder_id"])
 
         groups[group_key]["transactions"].append({
             "id": row["id"],
             "date": row["date"],
             "amount": converted_amount,
+            "original_amount": amount,
+            "currency": row["currency"] or currency_code,
         })
 
     # Analyze each group for recurring patterns
-    recurring = []
+    detected = []
+    ended = []
 
     for group_key, group_data in groups.items():
         txs = group_data["transactions"]
@@ -1951,90 +2030,79 @@ def detect_recurring(
         if not intervals:
             continue
 
-        # Determine average interval
-        avg_interval = sum(intervals) / len(intervals)
+        # Determine the typical interval (a median survives a skipped or a doubled payment)
+        typical_interval = _median(intervals)
 
         # Classify frequency
-        if 25 <= avg_interval <= 35:
+        if 25 <= typical_interval <= 35:
             frequency = "monthly"
             interval_days = 30
-        elif 6 <= avg_interval <= 8:
+        elif 6 <= typical_interval <= 8:
             frequency = "weekly"
             interval_days = 7
-        elif 12 <= avg_interval <= 16:
+        elif 12 <= typical_interval <= 16:
             frequency = "biweekly"
             interval_days = 14
-        elif 85 <= avg_interval <= 95:
+        elif 85 <= typical_interval <= 95:
             frequency = "quarterly"
             interval_days = 90
-        elif 360 <= avg_interval <= 370:
+        elif 360 <= typical_interval <= 370:
             frequency = "yearly"
             interval_days = 365
         else:
             # Not a clear pattern
             continue
 
-        # Check amount stability
+        # Check amount stability from one payment to the next: comparing the extremes
+        # of a long window would reject a price that drifts slowly (currency rates)
         amounts = [tx["amount"] for tx in txs]
         avg_amount = sum(amounts) / len(amounts)
-        max_amount = max(amounts)
-        min_amount = min(amounts)
-
-        if avg_amount > 0:
-            variation_pct = ((max_amount - min_amount) / avg_amount) * 100
-        else:
-            variation_pct = 0
 
         # Skip if amounts vary too much
-        if variation_pct > tolerance_pct:
+        if not all(_amounts_close(a, b, tolerance_pct) for a, b in zip(amounts, amounts[1:])):
             continue
 
-        # Check consistency (at least 2 occurrences expected within lookback period)
-        expected_occurrences = (lookback_months * 30) / interval_days
+        # Check regularity over the pattern's own span (first to last payment), not the
+        # whole lookback window: a subscription that started mid-window is still regular.
+        # The span is divided by the typical interval: calendar months are not 30 days
+        first_payment_date = date.fromisoformat(txs[0]["date"])
+        last_payment_date = date.fromisoformat(txs[-1]["date"])
+        expected_occurrences = round((last_payment_date - first_payment_date).days / typical_interval) + 1
         actual_occurrences = len(txs)
-        confidence = min(actual_occurrences / max(expected_occurrences, 1), 1.0)
+        regularity = min(actual_occurrences / expected_occurrences, 1.0)
+
+        # Two payments are weak evidence, and for intervals shorter than a month no
+        # evidence at all (two same-priced purchases a week apart are common)
+        if actual_occurrences < 3 and interval_days < 30:
+            continue
+        confidence = regularity * min(actual_occurrences / 3, 1.0)
 
         # Skip if confidence too low
         if confidence < 0.5:
             continue
 
-        # Get tag name
-        tag_name = None
-        if group_data["tag"]:
-            tag_row = conn.execute(
-                "SELECT title FROM tags WHERE id = ?", (group_data["tag"],)
-            ).fetchone()
-            if tag_row:
-                tag_name = tag_row["title"]
-
-        # Classify type based on MCC and tag
-        mcc = group_data["mcc"]
-        if tag_name:
-            tag_lower = tag_name.lower()
-            if any(word in tag_lower for word in ["подписка", "subscription", "сервис"]):
-                payment_type = "subscription"
-            elif any(word in tag_lower for word in ["жкх", "коммунал", "utility"]):
-                payment_type = "utility"
-            elif any(word in tag_lower for word in ["кредит", "loan"]):
-                payment_type = "loan"
-            elif any(word in tag_lower for word in ["страхов", "insurance"]):
-                payment_type = "insurance"
-            else:
-                payment_type = "other"
-        else:
-            payment_type = "other"
+        tag_name = group_data["tag_title"]
 
         # Calculate next expected payment
-        last_payment_date = date.fromisoformat(txs[-1]["date"])
         next_expected = last_payment_date + timedelta(days=int(interval_days))
 
         # Calculate yearly cost
-        yearly_cost = avg_amount * (365 / interval_days)
+        yearly_cost = avg_amount * _PAYMENTS_PER_YEAR[frequency]
 
-        recurring.append({
-            "name": group_data["payee"],
+        # Original amount, when every payment was made in the same currency
+        if len({tx["currency"] for tx in txs}) == 1:
+            original_amount = sum(tx["original_amount"] for tx in txs) / len(txs)
+            original_currency = txs[0]["currency"]
+        else:
+            original_amount = avg_amount
+            original_currency = currency_code
+
+        item = {
+            "name": group_data["payee"] or group_data["comment"] or tag_name or "Unknown",
             "merchant_id": group_data["merchant_id"],
             "avg_amount": round(avg_amount, 2),
+            "original_amount": round(original_amount, 2),
+            "original_currency": original_currency,
             "frequency": frequency,
             "interval_days": interval_days,
             "category": tag_name,
@@ -2043,65 +2111,107 @@ def detect_recurring(
             "next_expected": next_expected.isoformat() if next_expected <= today + timedelta(days=60) else None,
             "confidence": round(confidence, 2),
             "source": "detected",
-            "type": payment_type,
+            "type": _recurring_type(tag_name),
             "occurrences": actual_occurrences,
             "yearly_cost": round(yearly_cost, 2),
-        })
+        }
 
-    # Build set of detected names for dedup
-    detected_names = {r["name"].strip().lower() for r in recurring if r.get("name")}
-
-    # Add reminders with interval != null
-    reminder_rows = conn.execute("""
-        SELECT r.id, r.interval, r.step, r.outcome, r.payee, r.tag,
-               r.outcome_account, t.title as tag_title, a.title as account_title
-        FROM reminders r
-        LEFT JOIN tags t ON t.id = json_extract(r.tag, '$[0]')
-        LEFT JOIN accounts a ON a.id = r.outcome_account
-        WHERE r.interval IS NOT NULL AND r.outcome > 0
-    """).fetchall()
-
-    for row in reminder_rows:
-        # Skip if already detected from transactions
-        reminder_name = (row["payee"] or "Unknown").strip().lower()
-        if reminder_name in detected_names:
+        # A pattern whose last payment is older than 1.5 intervals is no longer active
+        if (today - last_payment_date).days > 1.5 * interval_days:
+            ended.append({
+                key: item[key]
+                for key in (
+                    "name", "avg_amount", "original_amount", "original_currency",
+                    "frequency", "category", "account", "last_payment", "occurrences",
+                )
+            })
             continue
 
-        frequency_map = {
-            "day": "daily",
-            "week": "weekly",
-            "month": "monthly",
-            "year": "yearly",
-        }
-        frequency = frequency_map.get(row["interval"], row["interval"])
+        detected.append({
+            "item": item,
+            "amount": avg_amount,
+            "merchant_id": group_data["merchant_id"],
+            "payee": group_data["payee"],
+            "tag_id": group_data["tag"],
+            "reminder_ids": group_data["reminder_ids"],
+        })
 
-        # Compute yearly_cost from amount and frequency
-        interval_days_map = {
-            "daily": 1,
-            "weekly": 7,
-            "month": 30,
-            "monthly": 30,
-            "year": 365,
-            "yearly": 365,
-        }
-        interval_d = interval_days_map.get(frequency, 30)
-        yearly_cost = row["outcome"] * (365 / interval_d)
+    # Add repeating reminders that are still in force (transfers between accounts are
+    # not payments). A reminder has no instrument of its own: its amount is in the
+    # currency of its account.
+    reminder_rows = conn.execute("""
+        SELECT r.id, r.interval, r.step, r.outcome, r.payee, r.comment, r.merchant,
+               json_extract(r.tag, '$[0]') as tag_id,
+               r.outcome_account, t.title as tag_title, a.title as account_title,
+               m.title as merchant_title,
+               i.short_title as currency, i.rate
+        FROM reminders r
+        LEFT JOIN tags t ON t.id = json_extract(r.tag, '$[0]')
+        LEFT JOIN merchants m ON m.id = r.merchant
+        LEFT JOIN accounts a ON a.id = r.outcome_account
+        LEFT JOIN instruments i ON i.id = a.instrument
+        WHERE r.interval IN ('day', 'week', 'month', 'year')
+          AND r.outcome > 0
+          AND (r.income IS NULL OR r.income = 0)
+          AND (r.end_date IS NULL OR r.end_date >= ?)
+    """, (today.isoformat(),)).fetchall()
 
-        recurring.append({
-            "name": row["payee"] or "Unknown",
-            "merchant_id": None,
-            "avg_amount": round(row["outcome"], 2),
+    recurring = []
+    for row in reminder_rows:
+        # Convert to user currency
+        if row["rate"] and user_rate:
+            amount = row["outcome"] * row["rate"] / user_rate
+        else:
+            amount = row["outcome"]
+
+        # A reminder repeats every `step` intervals
+        step = row["step"] or 1
+        base_frequency = _REMINDER_FREQUENCY[row["interval"]]
+        frequency = base_frequency if step == 1 else f"every {step} {row['interval']}s"
+        yearly_cost = amount * _PAYMENTS_PER_YEAR[base_frequency] / step
+
+        payee = _first_text(row["merchant_title"], row["payee"])
+        item = {
+            "name": payee or _first_text(row["comment"], row["tag_title"]) or "Unknown",
+            "merchant_id": row["merchant"],
+            "avg_amount": round(amount, 2),
+            "original_amount": round(row["outcome"], 2),
+            "original_currency": row["currency"] or currency_code,
             "frequency": frequency,
             "category": row["tag_title"],
             "account": row["account_title"],
             "confidence": 1.0,
             "source": "reminder",
-            "type": "other",
+            "type": _recurring_type(row["tag_title"]),
             "yearly_cost": round(yearly_cost, 2),
-        })
+        }
+
+        # The reminder replaces the patterns its own payments left in the history
+        reminder = {
+            "id": row["id"],
+            "amount": amount,
+            "merchant_id": row["merchant"],
+            "payee": payee,
+            "tag_id": row["tag_id"],
+        }
+        matches, others = [], []
+        for pattern in detected:
+            same = _is_same_recurring_payment(reminder, pattern, tolerance_pct)
+            (matches if same else others).append(pattern)
+        if matches:
+            detected = others
+            item["last_payment"] = max(p["item"]["last_payment"] for p in matches)
+            item["occurrences"] = sum(p["item"]["occurrences"] for p in matches)
+
+        recurring.append(item)
+
+    recurring.extend(p["item"] for p in detected)
 
     # Sort by yearly cost descending
     recurring.sort(key=lambda x: x.get("yearly_cost", 0), reverse=True)
+
+    # Most recently ended first
+    ended.sort(key=lambda x: x["last_payment"], reverse=True)
 
     # Calculate totals
     total_monthly = sum(r.get("yearly_cost", 0) / 12 for r in recurring)
@@ -2113,6 +2223,8 @@ def detect_recurring(
         "currency": currency_code,
         "recurring": recurring,
         "total_found": len(recurring),
+        "ended": ended[:10],
+        "ended_count": len(ended),
     }
 
 
@@ -2427,6 +2539,10 @@ def analyze_trends(
     return result
 
 
+# How far back a still-planned reminder marker is reported as overdue
+_OVERDUE_LOOKBACK_DAYS = 30
+
+
 def get_upcoming_payments(
     db: Database,
     days_ahead: int = 30,
@@ -2440,8 +2556,17 @@ def get_upcoming_payments(
         days_ahead: Planning horizon in days (default 30).
 
     Returns:
-        Dictionary with upcoming payments and weekly/monthly load.
+        Dictionary with upcoming payments and incomes, planned transfers between
+        accounts (listed apart, never counted as spending), overdue items (still
+        planned although their date passed within the last 30 days) and weekly load.
+        Amounts are in the user's currency; each item keeps its original amount.
+
+    Raises:
+        ValueError: If days_ahead is out of range.
     """
+    if not isinstance(days_ahead, int) or not 0 <= days_ahead <= 3650:
+        raise ValueError(f"days_ahead must be a whole number from 0 to 3650, got {days_ahead!r}")
+
     conn = db.connect()
 
     # Get user currency
@@ -2459,8 +2584,9 @@ def get_upcoming_payments(
     # Calculate date range
     today = date.today()
     end_date = (today + timedelta(days=days_ahead)).isoformat()
+    overdue_from = (today - timedelta(days=_OVERDUE_LOOKBACK_DAYS)).isoformat()
 
-    # Query upcoming reminder markers
+    # Query planned reminder markers: upcoming ones and those that are overdue
     rows = conn.execute("""
         SELECT
             rm.id,
@@ -2476,74 +2602,112 @@ def get_upcoming_payments(
             rm.reminder,
             ia.title as income_account_title,
             oa.title as outcome_account_title,
-            oa.instrument as outcome_instrument,
-            ia.instrument as income_instrument,
+            oi.short_title as outcome_currency,
+            oi.rate as outcome_rate,
+            ii.short_title as income_currency,
+            ii.rate as income_rate,
             t.title as tag_title,
             m.title as merchant_title
         FROM reminder_markers rm
         LEFT JOIN accounts ia ON ia.id = rm.income_account
         LEFT JOIN accounts oa ON oa.id = rm.outcome_account
+        LEFT JOIN instruments ii ON ii.id = ia.instrument
+        LEFT JOIN instruments oi ON oi.id = oa.instrument
         LEFT JOIN tags t ON t.id = json_extract(rm.tag, '$[0]')
         LEFT JOIN merchants m ON m.id = rm.merchant
         WHERE rm.state = 'planned'
           AND rm.date >= ?
           AND rm.date <= ?
         ORDER BY rm.date ASC
-    """, (today.isoformat(), end_date)).fetchall()
+    """, (overdue_from, end_date)).fetchall()
 
     upcoming = []
+    transfers = []
+    overdue = []
     total_income = 0.0
     total_outcome = 0.0
+    total_transfers = 0.0
+    total_overdue_income = 0.0
+    total_overdue_outcome = 0.0
 
     for row in rows:
         income = row["income"] or 0
         outcome = row["outcome"] or 0
 
-        # Determine type and convert amount
-        if outcome > 0:
+        # Determine type; a marker's amount is in the currency of its account
+        if outcome > 0 and income > 0:
+            tx_type = "transfer"  # between own accounts: not a payment
+        elif outcome > 0:
             tx_type = "outcome"
-            amount = outcome
-            instrument_id = row["outcome_instrument"]
-            account = row["outcome_account_title"]
         elif income > 0:
             tx_type = "income"
-            amount = income
-            instrument_id = row["income_instrument"]
-            account = row["income_account_title"]
         else:
             continue  # Skip zero-amount markers
 
+        if tx_type == "income":
+            amount = income
+            rate = row["income_rate"]
+            original_currency = row["income_currency"]
+            account = row["income_account_title"]
+        else:
+            amount = outcome
+            rate = row["outcome_rate"]
+            original_currency = row["outcome_currency"]
+            account = row["outcome_account_title"]
+
         # Convert to user currency
-        if instrument_id and instrument_id != user_currency_id:
-            source_rate = db.get_instrument_rate(instrument_id)
-            converted_amount = amount * source_rate / user_rate if user_rate else amount
-        else:
-            converted_amount = amount
+        converted_amount = amount * rate / user_rate if rate and user_rate else amount
 
-        # Aggregate totals
-        if tx_type == "outcome":
-            total_outcome += converted_amount
-        else:
-            total_income += converted_amount
-
-        # Get category name
-        category = row["tag_title"]
-
-        # Get payee/merchant
-        payee = row["merchant_title"] or row["payee"] or "Unknown"
-
-        upcoming.append({
+        item = {
             "id": row["id"],
             "date": row["date"],
             "type": tx_type,
             "amount": round(converted_amount, 2),
             "currency": currency_code,
-            "account": account,
-            "category": category,
-            "payee": payee,
+            "original_amount": round(amount, 2),
+            "original_currency": original_currency or currency_code,
+        }
+
+        if tx_type == "transfer":
+            item.update({
+                "from_account": account,
+                "to_account": row["income_account_title"],
+                "received_amount": round(income, 2),
+                "received_currency": row["income_currency"] or currency_code,
+            })
+        else:
+            item.update({
+                "account": account,
+                "category": row["tag_title"],
+                "payee": _first_text(
+                    row["merchant_title"], row["payee"], row["comment"], row["tag_title"]
+                ) or "Unknown",
+            })
+        item.update({
             "comment": row["comment"],
             "reminder_id": row["reminder"],
         })
+
+        # A marker still planned after its date was neither paid nor cancelled
+        if row["date"] < today.isoformat():
+            item["days_overdue"] = (today - date.fromisoformat(row["date"])).days
+            overdue.append(item)
+            if tx_type == "outcome":
+                total_overdue_outcome += converted_amount
+            elif tx_type == "income":
+                total_overdue_income += converted_amount
+            continue
+
+        # Aggregate totals (transfers are kept out of income and outcome)
+        if tx_type == "transfer":
+            transfers.append(item)
+            total_transfers += converted_amount
+        elif tx_type == "outcome":
+            upcoming.append(item)
+            total_outcome += converted_amount
+        else:
+            upcoming.append(item)
+            total_income += converted_amount
 
     # Calculate weekly load
     weekly_load = []
@@ -2573,13 +2737,22 @@ def get_upcoming_payments(
 
     return {
         "upcoming": upcoming,
+        "upcoming_count": len(upcoming),
         "total_upcoming_outcome": round(total_outcome, 2),
         "total_upcoming_income": round(total_income, 2),
+        "transfers": transfers,
+        "transfers_count": len(transfers),
+        "total_transfers": round(total_transfers, 2),
+        "overdue": overdue,
+        "overdue_count": len(overdue),
+        "total_overdue_outcome": round(total_overdue_outcome, 2),
+        "total_overdue_income": round(total_overdue_income, 2),
         "currency": currency_code,
         "period": {
             "start": today.isoformat(),
             "end": end_date,
             "days": days_ahead,
+            "overdue_from": overdue_from,
         },
         "weekly_load": weekly_load,
     }
@@ -2906,7 +3079,9 @@ def detect_anomalies(
         end_date: Optional explicit end date (ISO). Used with start_date.
 
     Returns:
-        Dictionary with detected anomalies.
+        Dictionary with outliers (payments far above their category's average,
+        strongest first) and groups of possible duplicates (largest first), each
+        cut to 15 with the total count in the summary.
     """
     # Enforce minimum z_threshold
     z_threshold = max(z_threshold, 1.5)
@@ -2928,13 +3103,16 @@ def detect_anomalies(
     # Build query with optional category filter
     query = """
         SELECT
-            t.id, t.date, t.outcome, t.outcome_instrument, t.tag, t.merchant, t.payee,
+            t.id, t.date, t.outcome, t.outcome_instrument, t.merchant, t.payee,
             t.comment,
+            json_extract(t.tag, '$[0]') as tag_id,
             m.title as merchant_title,
-            tag.title as tag_title
+            tag.title as tag_title,
+            i.rate
         FROM transactions t
         LEFT JOIN merchants m ON m.id = t.merchant
         LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
+        LEFT JOIN instruments i ON i.id = t.outcome_instrument
         WHERE t.deleted = 0
           AND (t.hold IS NULL OR t.hold = 0)
           AND NOT (t.income > 0 AND t.outcome > 0)
@@ -2961,63 +3139,36 @@ def detect_anomalies(
     outliers = []
     duplicates = []
 
-    # Detect amount outliers by category
-    category_stats = {}
+    # Convert every amount to user currency once: both checks below reuse it
+    amounts = {}
     for row in rows:
-        tag_json = row["tag"]
-        if tag_json:
-            try:
-                tags = json.loads(tag_json)
-                category = tags[0] if tags else None
-            except:
-                category = None
-        else:
-            category = None
-
-        if category not in category_stats:
-            category_stats[category] = []
         amount = row["outcome"]
-        instrument_id = row["outcome_instrument"]
-        if instrument_id and instrument_id != user_currency_id:
-            source_rate = db.get_instrument_rate(instrument_id)
-            amount = amount * source_rate / user_rate if user_rate else amount
-        category_stats[category].append(amount)
+        if row["rate"] and user_rate and row["outcome_instrument"] != user_currency_id:
+            amount = amount * row["rate"] / user_rate
+        amounts[row["id"]] = amount
 
-    # Calculate stats for each category
-    for category, amounts in category_stats.items():
-        if len(amounts) < 3:
+    # Detect amount outliers by category
+    category_rows: dict[str | None, list[Any]] = {}
+    for row in rows:
+        category_rows.setdefault(row["tag_id"], []).append(row)
+
+    for rows_in_category in category_rows.values():
+        if len(rows_in_category) < 3:
             continue  # Need at least 3 for meaningful stats
 
-        mean = sum(amounts) / len(amounts)
-        variance = sum((x - mean) ** 2 for x in amounts) / len(amounts)
+        values = [amounts[row["id"]] for row in rows_in_category]
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
         stddev = variance ** 0.5
 
         if stddev == 0:
             continue
 
         # Find outliers
-        for row in rows:
-            tag_json = row["tag"]
-            if tag_json:
-                try:
-                    tags = json.loads(tag_json)
-                    row_category = tags[0] if tags else None
-                except:
-                    row_category = None
-            else:
-                row_category = None
-
-            if row_category != category:
-                continue
-
-            amount = row["outcome"]
-            instrument_id = row["outcome_instrument"]
-            if instrument_id and instrument_id != user_currency_id:
-                source_rate = db.get_instrument_rate(instrument_id)
-                amount = amount * source_rate / user_rate if user_rate else amount
-
-            z_score = abs(amount - mean) / stddev
-            if z_score > z_threshold:
+        for row, amount in zip(rows_in_category, values):
+            # Only unusually large spending is an anomaly, not a small payment
+            z_score = (amount - mean) / stddev
+            if z_score >= z_threshold:
                 outliers.append({
                     "transaction_id": row["id"],
                     "date": row["date"],
@@ -3030,52 +3181,52 @@ def detect_anomalies(
                     "severity": "high" if z_score >= 3.0 else ("medium" if z_score >= 2.0 else "low"),
                 })
 
-    # Detect possible duplicates (same amount, date ±1 day, same payee)
-    checked_pairs = set()
-    for i, row1 in enumerate(rows):
-        for row2 in rows[i+1:]:
-            pair_key = tuple(sorted([row1["id"], row2["id"]]))
-            if pair_key in checked_pairs:
+    # Detect possible duplicates (same payee, same amount, dates within a day of each
+    # other) in one pass: bucket by payee and amount, then split each bucket by date
+    same_payee_and_amount: dict[tuple[str, float], list[Any]] = {}
+    for row in rows:
+        payee = row["merchant_title"] or row["payee"]
+        if payee:
+            same_payee_and_amount.setdefault((payee, round(amounts[row["id"]], 2)), []).append(row)
+
+    for (payee, amount), bucket in same_payee_and_amount.items():
+        if len(bucket) < 2:
+            continue
+
+        bucket.sort(key=lambda row: row["date"])
+        runs = [[bucket[0]]]
+        for row in bucket[1:]:
+            previous_date = date.fromisoformat(runs[-1][-1]["date"])
+            if (date.fromisoformat(row["date"]) - previous_date).days <= 1:
+                runs[-1].append(row)
+            else:
+                runs.append([row])
+
+        # Three identical payments are one group of 3, not three pairs
+        for run in runs:
+            if len(run) < 2:
                 continue
-            checked_pairs.add(pair_key)
+            duplicates.append({
+                "transactions": [row["id"] for row in run],
+                "count": len(run),
+                "date": run[0]["date"],
+                "amount": amount,
+                "payee": payee,
+                "severity": "medium",
+            })
 
-            # Convert amounts to user currency for comparison
-            amount1 = row1["outcome"]
-            instr1 = row1["outcome_instrument"]
-            if instr1 and instr1 != user_currency_id:
-                source_rate = db.get_instrument_rate(instr1)
-                amount1 = amount1 * source_rate / user_rate if user_rate else amount1
-
-            amount2 = row2["outcome"]
-            instr2 = row2["outcome_instrument"]
-            if instr2 and instr2 != user_currency_id:
-                source_rate = db.get_instrument_rate(instr2)
-                amount2 = amount2 * source_rate / user_rate if user_rate else amount2
-
-            # Check if amounts are close
-            if abs(amount1 - amount2) < 0.01:
-                # Check if dates are close
-                date1 = date.fromisoformat(row1["date"])
-                date2 = date.fromisoformat(row2["date"])
-                if abs((date1 - date2).days) <= 1:
-                    # Check if payees match
-                    payee1 = row1["merchant_title"] or row1["payee"] or ""
-                    payee2 = row2["merchant_title"] or row2["payee"] or ""
-                    if payee1 and payee2 and payee1 == payee2:
-                        duplicates.append({
-                            "transactions": [row1["id"], row2["id"]],
-                            "date": row1["date"],
-                            "amount": round(amount1, 2),
-                            "payee": payee1,
-                            "severity": "medium",
-                        })
+    # Strongest outliers and largest duplicates first, so that the cut keeps the ones that matter
+    outliers.sort(key=lambda x: (x["z_score"], x["amount"]), reverse=True)
+    duplicates.sort(key=lambda x: (x["amount"], x["count"]), reverse=True)
 
     return {
         "period": {"start": start_date, "end": end_date},
         "currency": currency_code,
         "summary": {
             "outliers_count": len(outliers),
+            "outliers_returned": min(len(outliers), 15),
             "duplicates_count": len(duplicates),
+            "duplicates_returned": min(len(duplicates), 15),
             "total_transactions_analyzed": len(rows),
         },
         "outliers": outliers[:15],
