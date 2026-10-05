@@ -368,7 +368,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_account_flow",
-            description="Get money flow for a specific account. Answers: 'What happened on my card?', 'Cash flow details'",
+            description="Get money flow for a specific account, in the account's own currency: income, outcome, transfers in and out, net change, opening and closing balance, and the transactions (first 50). Answers: 'What happened on my card?', 'Cash flow details'",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -379,6 +379,7 @@ async def list_tools() -> list[Tool]:
                     "period": {
                         "type": "string",
                         "description": PERIOD_DESCRIPTION,
+                        "default": "this_month",
                     },
                     "start_date": {
                         "type": "string",
@@ -389,7 +390,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
                     },
                 },
-                "required": ["account_id", "period"],
+                "required": ["account_id"],
             },
         ),
         Tool(
@@ -502,13 +503,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="search_transactions",
-            description="Search transactions by various criteria: date, category, account, amount, payee.",
+            description="Search transactions by various criteria: date, category, account, amount, payee. Without period and dates the whole history is searched; the answer states the period used. Transfers and exchanges show both sides.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "period": {
                         "type": "string",
-                        "description": PERIOD_DESCRIPTION,
+                        "description": PERIOD_DESCRIPTION + ". Omit it (and the dates) to search the whole history.",
                     },
                     "start_date": {
                         "type": "string",
@@ -516,7 +517,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "end_date": {
                         "type": "string",
-                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
+                        "description": "Custom end date (ISO). If omitted with start_date, defaults to today. Alone (no start_date, no period): everything up to this date.",
                     },
                     "category_id": {
                         "type": "string",
@@ -532,7 +533,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "payee_search": {
                         "type": "string",
-                        "description": "Search by payee, comment, or merchant name",
+                        "description": "Text to find in payee, comment, or merchant name (case-insensitive, taken literally)",
                     },
                     "min_amount": {
                         "type": "number",
@@ -549,8 +550,10 @@ async def list_tools() -> list[Tool]:
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum results",
+                        "description": "Maximum results (1-200)",
                         "default": 50,
+                        "minimum": 1,
+                        "maximum": 200,
                     },
                 },
             },
@@ -647,7 +650,7 @@ async def _run_tool(name: str, arguments: dict[str, Any], db: Database) -> dict[
         return get_account_flow(
             db,
             account_id=arguments.get("account_id"),
-            period=arguments.get("period"),
+            period=arguments.get("period", "this_month"),
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
         )

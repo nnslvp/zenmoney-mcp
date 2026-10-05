@@ -2183,8 +2183,17 @@ def analyze_transfers(
             "comment": row["comment"],
         }
 
-        if is_currency_exchange and row["income"] > 0:
-            transfer_data["effective_rate"] = round(row["outcome"] / row["income"], 4)
+        if is_currency_exchange:
+            # Quote the rate the way people say it: the price of one unit of the
+            # dearer currency ("1 USD = 3.8 PLN"), whichever way the money went.
+            base, quote = (
+                ("outcome", "income") if row["outcome"] <= row["income"] else ("income", "outcome")
+            )
+            rate = round(row[quote] / row[base], 4)
+            transfer_data["effective_rate"] = rate
+            transfer_data["rate_description"] = (
+                f"1 {row[f'{base}_currency']} = {rate} {row[f'{quote}_currency']}"
+            )
 
         transfers.append(transfer_data)
         total_amount += amount_user
@@ -2416,16 +2425,37 @@ def detect_anomalies(
     }
 
 
+# What a transaction adds to (credited) or takes from (debited) one account, in
+# that account's currency. A side's instrument is the account's own, except on a
+# debt account: its rows carry the currency of the other account (see Transaction
+# in the API doc). Those are converted at the current rates, which is also how
+# the debt account's balance is kept.
+_ACCOUNT_CREDITED_SQL = """
+    CASE WHEN t.income_account = :account THEN t.income * CASE
+        WHEN t.income_instrument = :instrument THEN 1.0
+        ELSE COALESCE(ii.rate / :rate, 1.0) END
+    ELSE 0 END"""
+_ACCOUNT_DEBITED_SQL = """
+    CASE WHEN t.outcome_account = :account THEN t.outcome * CASE
+        WHEN t.outcome_instrument = :instrument THEN 1.0
+        ELSE COALESCE(oi.rate / :rate, 1.0) END
+    ELSE 0 END"""
+
+
 def get_account_flow(
     db: Database,
     account_id: str,
-    period: str,
+    period: str = "this_month",
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
     """Get cash flow for a specific account.
 
     T14: "What happened on my card?", "Cash flow details"
+
+    All amounts are in the account's own currency. net_change covers income,
+    outcome and transfers both ways, so opening_balance + net_change =
+    closing_balance.
 
     Args:
         db: Database instance.
@@ -2440,55 +2470,60 @@ def get_account_flow(
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
 
-    # Get account info
-    account_row = conn.execute(
-        "SELECT title, type, balance, instrument FROM accounts WHERE id = ?",
-        (account_id,)
-    ).fetchone()
+    # Get account info. Every amount below is in this account's own currency:
+    # it is one account, so nothing is converted to the user's currency.
+    account_row = conn.execute("""
+        SELECT a.title, a.type, a.balance, a.instrument,
+               i.short_title AS currency, i.rate
+        FROM accounts a
+        LEFT JOIN instruments i ON i.id = a.instrument
+        WHERE a.id = ?
+    """, (account_id,)).fetchone()
 
     if not account_row:
         raise ValueError(f"Account {account_id} not found")
 
     account_title = account_row["title"]
     account_type = account_row["type"]
+    account_currency = account_row["currency"]
     current_balance = account_row["balance"] or 0
-
-    # Get user currency
-    user_currency_id = db.get_user_currency()
-    if not user_currency_id:
-        user_currency_id = 2  # Default to RUB
-
-    currency_row = conn.execute(
-        "SELECT short_title FROM instruments WHERE id = ?",
-        (user_currency_id,)
-    ).fetchone()
-    currency_code = currency_row["short_title"] if currency_row else "RUB"
+    account_params = {
+        "account": account_id,
+        "instrument": account_row["instrument"],
+        "rate": account_row["rate"],
+    }
 
     # Query all transactions involving this account
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
-            t.id, t.date, t.income, t.outcome, t.comment,
+            t.id, t.date, t.income, t.outcome, t.hold, t.comment,
             t.income_account, t.outcome_account,
             t.income_instrument, t.outcome_instrument,
             t.tag, t.merchant, t.payee,
+            {_ACCOUNT_CREDITED_SQL} AS credited,
+            {_ACCOUNT_DEBITED_SQL} AS debited,
             m.title as merchant_title,
             tag.title as tag_title,
             ia.title as income_account_title,
-            oa.title as outcome_account_title
+            oa.title as outcome_account_title,
+            ii.short_title as income_currency,
+            oi.short_title as outcome_currency
         FROM transactions t
         LEFT JOIN merchants m ON m.id = t.merchant
         LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
         LEFT JOIN accounts ia ON ia.id = t.income_account
         LEFT JOIN accounts oa ON oa.id = t.outcome_account
+        LEFT JOIN instruments ii ON ii.id = t.income_instrument
+        LEFT JOIN instruments oi ON oi.id = t.outcome_instrument
         WHERE t.deleted = 0
-          AND t.date >= ? AND t.date <= ?
-          AND (t.income_account = ? OR t.outcome_account = ?)
+          AND t.date >= :start AND t.date <= :end
+          AND (t.income_account = :account OR t.outcome_account = :account)
         ORDER BY t.date DESC
-    """, (start_date, end_date, account_id, account_id)).fetchall()
+    """, {**account_params, "start": start_date, "end": end_date}).fetchall()
 
     # Categorize transactions
-    income_total = 0.0
-    outcome_total = 0.0
+    totals = {"income": 0.0, "outcome": 0.0, "transfer_in": 0.0, "transfer_out": 0.0}
+    holds_excluded = 0
     by_category_map = {}
     transactions = []
 
@@ -2504,33 +2539,41 @@ def get_account_flow(
             # Pure income
             if income_account == account_id:
                 tx_type = "income"
-                amount = income
-                income_total += income
             else:
                 continue
         elif income == 0 and outcome > 0:
             # Pure expense
             if outcome_account == account_id:
                 tx_type = "outcome"
-                amount = outcome
-                outcome_total += outcome
             else:
                 continue
         elif income > 0 and outcome > 0:
             # Transfer or exchange
             if income_account == account_id and outcome_account != account_id:
                 tx_type = "transfer_in"
-                amount = income
             elif outcome_account == account_id and income_account != account_id:
                 tx_type = "transfer_out"
-                amount = outcome
             else:
                 continue
         else:
             continue
 
+        # The account's side of the transaction, in the account's currency
+        side = "income" if tx_type in ["income", "transfer_in"] else "outcome"
+        amount = row["credited"] if side == "income" else row["debited"]
+
+        # Totals and balances are built from the rows accounts.balance itself
+        # consists of: not deleted and not on hold (checked against real balances -
+        # a pending hold is not in the balance yet). Holds stay in the list,
+        # flagged, so that pending card payments remain visible.
+        on_hold = bool(row["hold"])
+        if on_hold:
+            holds_excluded += 1
+        else:
+            totals[tx_type] += amount
+
         # Category aggregation (only for income/outcome, not transfers)
-        if tx_type in ["income", "outcome"]:
+        if tx_type in ["income", "outcome"] and not on_hold:
             category = row["tag_title"] or "Uncategorized"
             if category not in by_category_map:
                 by_category_map[category] = {"type": tx_type, "total": 0.0, "count": 0}
@@ -2538,7 +2581,7 @@ def get_account_flow(
             by_category_map[category]["count"] += 1
 
         # Transaction list
-        transactions.append({
+        transaction = {
             "id": row["id"],
             "date": row["date"],
             "type": tx_type,
@@ -2550,10 +2593,36 @@ def get_account_flow(
                 row["outcome_account_title"] if tx_type in ["transfer_in", "income"]
                 else row["income_account_title"]
             ),
-        })
+            "hold": on_hold,
+        }
+        if row[f"{side}_instrument"] != account_row["instrument"]:
+            # Converted above: keep what the transaction itself says
+            transaction["original_amount"] = round(row[side], 2)
+            transaction["original_currency"] = row[f"{side}_currency"]
+        transactions.append(transaction)
 
-    # Calculate net change
-    net_change = income_total - outcome_total
+    # Net change covers every movement of the account, transfers included:
+    # only then does it match how the balance moved. The figures are rounded
+    # before they are combined, so that the reported ones add up to the cent.
+    totals = {kind: round(total, 2) for kind, total in totals.items()}
+    net_change = round(
+        totals["income"] + totals["transfer_in"] - totals["outcome"] - totals["transfer_out"], 2
+    )
+
+    # The cache keeps only today's balance, so the balance at the end of the
+    # period is today's balance with every later movement rolled back.
+    moved_after_period = conn.execute(f"""
+        SELECT COALESCE(SUM({_ACCOUNT_CREDITED_SQL} - {_ACCOUNT_DEBITED_SQL}), 0) AS total
+        FROM transactions t
+        LEFT JOIN instruments ii ON ii.id = t.income_instrument
+        LEFT JOIN instruments oi ON oi.id = t.outcome_instrument
+        WHERE t.deleted = 0
+          AND (t.hold IS NULL OR t.hold = 0)
+          AND t.date > :end
+          AND (t.income_account = :account OR t.outcome_account = :account)
+    """, {**account_params, "end": end_date}).fetchone()["total"]
+    closing_balance = round(current_balance - moved_after_period, 2)
+    opening_balance = round(closing_balance - net_change, 2)
 
     # Format by_category
     by_category = [
@@ -2567,22 +2636,32 @@ def get_account_flow(
     ]
     by_category.sort(key=lambda x: x["total"], reverse=True)
 
+    returned = transactions[:50]  # Limit to 50; the summary covers all of them
+
     return {
         "account": {
             "id": account_id,
             "title": account_title,
             "type": account_type,
+            "currency": account_currency,
             "balance": round(current_balance, 2),
         },
         "period": {"start": start_date, "end": end_date},
         "summary": {
-            "total_income": round(income_total, 2),
-            "total_outcome": round(outcome_total, 2),
-            "net_change": round(net_change, 2),
-            "transaction_count": len(transactions),
+            "currency": account_currency,
+            "income": totals["income"],
+            "outcome": totals["outcome"],
+            "transfers_in": totals["transfer_in"],
+            "transfers_out": totals["transfer_out"],
+            "net_change": net_change,
+            "opening_balance": opening_balance,
+            "closing_balance": closing_balance,
+            "holds_excluded": holds_excluded,
             "by_category": by_category,
         },
-        "transactions": transactions[:50],  # Limit to 50
+        "total_count": len(transactions),
+        "returned_count": len(returned),
+        "transactions": returned,
     }
 
 
@@ -2659,12 +2738,30 @@ async def suggest_category(
                 "name": tag_map.get(tag_id, tag_id),
             })
 
+    # The API names the merchant by id only; the title comes from the local cache
+    merchant_id = data.get("merchant")
+    merchant_title = None
+    if merchant_id:
+        merchant_row = conn.execute(
+            "SELECT title FROM merchants WHERE id = ?", (merchant_id,)
+        ).fetchone()
+        merchant_title = merchant_row["title"] if merchant_row else None
+
     return {
         "original_payee": payee,
         "normalized_payee": data.get("payee", payee),
-        "suggested_merchant_id": data.get("merchant"),
+        "suggested_merchant": merchant_title,
+        "suggested_merchant_id": merchant_id,
         "suggested_categories": tag_titles,
     }
+
+
+_SEARCH_MAX_LIMIT = 200
+
+
+def _casefold(value: Any) -> Any:
+    """Case folding for any script, for use in SQL (SQLite's LOWER and LIKE fold ASCII only)."""
+    return value.casefold() if isinstance(value, str) else value
 
 
 def search_transactions(
@@ -2687,7 +2784,8 @@ def search_transactions(
 
     Args:
         db: Database instance.
-        period: Optional time period filter.
+        period: Optional time period filter. Without it and without dates the
+            whole history is searched.
         category_id: Filter by category (includes children).
         account_id: Filter by account.
         merchant_id: Filter by merchant.
@@ -2695,13 +2793,21 @@ def search_transactions(
         min_amount: Minimum transaction amount.
         max_amount: Maximum transaction amount.
         tx_type: Transaction type ("income", "outcome", "transfer").
-        limit: Maximum results to return.
+        limit: Maximum results to return (1 to 200).
         start_date: Optional explicit start date (ISO). Overrides period.
-        end_date: Optional explicit end date (ISO). Used with start_date.
+        end_date: Optional explicit end date (ISO). Without start_date (and
+            without period) everything up to this date is searched.
 
     Returns:
-        Dictionary with matching transactions.
+        Dictionary with matching transactions and the period searched.
+
+    Raises:
+        ValueError: If limit is out of range or the period/dates are invalid.
     """
+    # SQLite reads a negative LIMIT as "no limit", so the range is enforced here
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _SEARCH_MAX_LIMIT:
+        raise ValueError(f"Invalid limit {limit!r}: expected an integer from 1 to {_SEARCH_MAX_LIMIT}")
+
     conn = db.connect()
 
     # Get user currency for display
@@ -2729,11 +2835,30 @@ def search_transactions(
     """
     params: list[Any] = []
 
-    # Period filter
+    # Period filter. Unlike the reports, a search may be open-ended: with no
+    # period at all it covers the whole history, with end_date alone everything
+    # up to that date. The output says which dates were actually searched.
+    period_info: dict[str, Any]
     if start_date or period:
         sd, ed = get_period_dates(period or "this_month", start_date=start_date, end_date=end_date)
         query += " AND t.date BETWEEN ? AND ?"
         params.extend([sd, ed])
+        period_info = {"start": sd, "end": ed}
+    elif end_date:
+        ed = parse_iso_date(end_date, "end_date").isoformat()
+        query += " AND t.date <= ?"
+        params.append(ed)
+        period_info = {
+            "start": None,
+            "end": ed,
+            "note": "No start_date given: everything up to end_date was searched",
+        }
+    else:
+        period_info = {
+            "start": None,
+            "end": None,
+            "note": "No period or dates given: the whole history was searched",
+        }
 
     # Category filter (with children)
     if category_id:
@@ -2757,16 +2882,20 @@ def search_transactions(
         query += " AND t.merchant = ?"
         params.append(merchant_id)
 
-    # Payee search (LIKE on payee, original_payee, comment, merchant.title)
+    # Payee search (substring of payee, original_payee, comment, merchant.title).
+    # Case is folded in Python: SQLite on its own would miss "кофе" in "Кофе".
+    # Database caches one connection, so registering the function on every
+    # call is cheap and also covers a connection re-opened after close().
+    # instr() rather than LIKE: the query is plain text, "%" and "_" included.
     if payee_search:
-        search_pattern = f"%{payee_search}%"
+        conn.create_function("zm_casefold", 1, _casefold, deterministic=True)
         query += """ AND (
-            t.payee LIKE ? OR
-            t.original_payee LIKE ? OR
-            t.comment LIKE ? OR
-            m.title LIKE ?
+            instr(zm_casefold(t.payee), ?) > 0 OR
+            instr(zm_casefold(t.original_payee), ?) > 0 OR
+            instr(zm_casefold(t.comment), ?) > 0 OR
+            instr(zm_casefold(m.title), ?) > 0
         )"""
-        params.extend([search_pattern] * 4)
+        params.extend([_casefold(payee_search)] * 4)
 
     # Amount filters — compare in the user's currency so thresholds are meaningful
     # across multi-currency accounts. Transaction amounts are stored in each
@@ -2869,7 +2998,7 @@ def search_transactions(
         # Get payee/merchant
         payee = row["merchant_title"] or row["payee"] or row["comment"]
 
-        transactions.append({
+        transaction = {
             "id": row["id"],
             "date": row["date"],
             "type": tx_type_str,
@@ -2880,9 +3009,24 @@ def search_transactions(
             "payee": payee,
             "comment": row["comment"] if row["comment"] != payee else None,
             "hold": bool(row["hold"]),
-        })
+        }
+        if tx_type_str == "transfer":
+            # "amount" above is the outgoing side only; an exchange arrives as a
+            # different amount in a different currency, so spell out both sides
+            transaction["from"] = {
+                "account": row["outcome_account_title"],
+                "amount": outcome,
+                "currency": row["outcome_currency"],
+            }
+            transaction["to"] = {
+                "account": row["income_account_title"],
+                "amount": income,
+                "currency": row["income_currency"],
+            }
+        transactions.append(transaction)
 
     return {
+        "period": period_info,
         "transactions": transactions,
         "returned_count": len(transactions),
         "total_matching": total_count,

@@ -1411,14 +1411,14 @@ class TestT14GetAccountFlow:
         result = get_account_flow(populated_db, account_id="acc-rub", period="this_month")
 
         summary = result["summary"]
-        assert "total_income" in summary
-        assert "total_outcome" in summary
+        assert "income" in summary
+        assert "outcome" in summary
         assert "net_change" in summary
-        assert "transaction_count" in summary
+        assert "total_count" in result
 
         # acc-rub has: tx5 (+150000 income), tx1-tx4 (expenses), tx6/tx7/tx8 (transfers out)
-        assert summary["total_income"] > 0
-        assert summary["total_outcome"] > 0
+        assert summary["income"] > 0
+        assert summary["outcome"] > 0
 
     def test_get_account_flow_transaction_breakdown(self, populated_db: Database):
         """Test that transactions are categorized."""
@@ -1457,7 +1457,7 @@ class TestT14GetAccountFlow:
         # acc-save has only tx6, but might have empty periods
         result = get_account_flow(populated_db, account_id="acc-save", period="2020-01")
 
-        assert result["summary"]["transaction_count"] == 0
+        assert result["total_count"] == 0
         assert len(result["transactions"]) == 0
 
 
