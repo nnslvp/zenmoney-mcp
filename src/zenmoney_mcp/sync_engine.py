@@ -168,6 +168,10 @@ class SyncEngine:
                 if count > 0:
                     deleted[table_name] = deleted.get(table_name, 0) + count
 
+        retired = self.db.retire_orphan_markers()
+        if retired > 0:
+            deleted["reminder_markers"] = deleted.get("reminder_markers", 0) + retired
+
         return {"updated": updated, "deleted": deleted}
 
     def apply_diff_data(self, diff_data: dict[str, Any]) -> dict[str, Any]:
