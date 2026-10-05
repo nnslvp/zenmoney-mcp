@@ -1,6 +1,8 @@
 """Analytics business logic for ZenMoney MCP tools."""
 
+import calendar
 import json
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -10,60 +12,89 @@ from .database import Database
 from .utils import convert_to_user_currency
 
 
+PERIOD_FORMATS = (
+    "'this_month', 'last_month', 'this_year', 'last_year', "
+    "'last_N_days' (e.g. 'last_30_days'), 'YYYY-MM' or 'YYYY'"
+)
+
+_LAST_N_DAYS = re.compile(r"last_(\d+)_days")
+_YEAR_MONTH = re.compile(r"(\d{4})-(\d{2})")
+_YEAR = re.compile(r"\d{4}")
+
+
+def parse_iso_date(value: str, field: str) -> date:
+    """Parse a 'YYYY-MM-DD' date (a full ISO datetime is accepted, its time is dropped).
+
+    Dates are compared as strings in SQL, so anything else must be rejected here.
+    """
+    try:
+        return datetime.fromisoformat(value.strip()).date()
+    except (ValueError, AttributeError):
+        raise ValueError(f"Invalid {field} {value!r}: expected YYYY-MM-DD") from None
+
+
+def _month_bounds(year: int, month: int) -> tuple[date, date]:
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+
+
+def _named_period_bounds(period: str, today: date) -> tuple[date, date] | None:
+    if period == "this_month":
+        return _month_bounds(today.year, today.month)
+    if period == "last_month":
+        last_day = today.replace(day=1) - timedelta(days=1)
+        return _month_bounds(last_day.year, last_day.month)
+    if period == "this_year":
+        return date(today.year, 1, 1), date(today.year, 12, 31)
+    if period == "last_year":
+        return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
+    if match := _LAST_N_DAYS.fullmatch(period):
+        days = int(match.group(1))
+        if days >= 1:
+            return today - timedelta(days=days - 1), today
+    if match := _YEAR_MONTH.fullmatch(period):
+        year, month = int(match.group(1)), int(match.group(2))
+        if year >= 1 and 1 <= month <= 12:
+            return _month_bounds(year, month)
+    if _YEAR.fullmatch(period) and int(period) >= 1:
+        return date(int(period), 1, 1), date(int(period), 12, 31)
+    return None
+
+
 def get_period_dates(
     period: str,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> tuple[str, str]:
-    """Convert period string to start and end dates.
+    """Convert period string to start and end dates (both inclusive).
 
     Args:
-        period: One of "this_month", "last_month", "last_30_days", or "YYYY-MM"
+        period: One of PERIOD_FORMATS.
         start_date: Optional explicit start date (ISO format). Overrides period.
-        end_date: Optional explicit end date (ISO format). Used with start_date.
+        end_date: Optional explicit end date (ISO format). Defaults to today.
 
     Returns:
         Tuple of (start_date, end_date) as ISO strings.
-    """
-    if start_date:
-        if end_date:
-            return start_date, end_date
-        return start_date, date.today().isoformat()
 
+    Raises:
+        ValueError: If the period or a date cannot be parsed.
+    """
     today = date.today()
 
-    if period == "this_month":
-        start = today.replace(day=1)
-        # End of month
-        if today.month == 12:
-            end = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            end = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
-    elif period == "last_month":
-        first_of_this_month = today.replace(day=1)
-        end = first_of_this_month - timedelta(days=1)
-        start = end.replace(day=1)
-    elif period == "last_30_days":
-        end = today
-        start = today - timedelta(days=30)
-    else:
-        # Assume YYYY-MM format
-        try:
-            year, month = map(int, period.split("-"))
-            start = date(year, month, 1)
-            if month == 12:
-                end = date(year + 1, 1, 1) - timedelta(days=1)
-            else:
-                end = date(year, month + 1, 1) - timedelta(days=1)
-        except (ValueError, AttributeError):
-            # Fallback to this month
-            start = today.replace(day=1)
-            if today.month == 12:
-                end = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
-            else:
-                end = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
+    if start_date or end_date:
+        if not start_date:
+            raise ValueError("end_date requires start_date")
+        start = parse_iso_date(start_date, "start_date")
+        end = parse_iso_date(end_date, "end_date") if end_date else today
+        if start > end:
+            raise ValueError(f"start_date {start} is after end_date {end}")
+        return start.isoformat(), end.isoformat()
 
-    return start.isoformat(), end.isoformat()
+    bounds = _named_period_bounds(period, today) if isinstance(period, str) else None
+    if bounds is None:
+        raise ValueError(
+            f"Unknown period {period!r}. Use {PERIOD_FORMATS}, or pass start_date/end_date."
+        )
+    return bounds[0].isoformat(), bounds[1].isoformat()
 
 
 def get_net_worth(db: Database) -> dict[str, Any]:

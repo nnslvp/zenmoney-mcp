@@ -1,14 +1,19 @@
 """MCP Server for ZenMoney financial analytics."""
 
+import asyncio
 import json
 import os
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
 from mcp.types import Resource, TextContent, Tool
+from pydantic import AnyUrl
 
 from .analytics import (
+    PERIOD_FORMATS,
     analyze_income,
     analyze_merchants,
     analyze_spending,
@@ -34,11 +39,13 @@ from .analytics import (
     suggest_category,
 )
 from .database import Database
-from .sync_engine import SyncEngine
+from .sync_engine import SyncEngine, SyncError
 
 
 # Initialize MCP server
 server = Server("zenmoney-mcp")
+
+PERIOD_DESCRIPTION = f"Period: {PERIOD_FORMATS}"
 
 # Global state
 _db: Database | None = None
@@ -83,6 +90,62 @@ def init_for_testing(db: Database, token: str = "test_token") -> None:
     global _db, _sync_engine
     _db = db
     _sync_engine = SyncEngine(db, token)
+
+
+# Tools answer from the local cache; a cache older than this is synced first
+DEFAULT_AUTO_SYNC_SECONDS = 600
+
+_sync_lock = asyncio.Lock()
+
+
+def _auto_sync_seconds() -> int:
+    """Max cache age before a request triggers a sync. 0 disables auto-sync."""
+    try:
+        return int(os.environ.get("ZENMONEY_AUTO_SYNC_SECONDS", DEFAULT_AUTO_SYNC_SECONDS))
+    except ValueError:
+        return DEFAULT_AUTO_SYNC_SECONDS
+
+
+def _last_sync_time(db: Database) -> int | None:
+    value = db.get_meta("last_sync_time")
+    return int(value) if value else None
+
+
+async def ensure_fresh(db: Database) -> str | None:
+    """Sync the cache if it is older than the auto-sync threshold.
+
+    Returns:
+        A warning when the sync failed and the answer comes from a stale cache.
+
+    Raises:
+        SyncError, ValueError: If the sync failed and there is no cache to fall back on.
+    """
+    max_age = _auto_sync_seconds()
+    if max_age <= 0:
+        return None
+
+    async with _sync_lock:
+        last_sync = _last_sync_time(db)
+        if last_sync is not None and time.time() - last_sync < max_age:
+            return None
+        try:
+            await get_sync_engine().sync()
+        except (SyncError, ValueError) as e:
+            if last_sync is None:
+                raise
+            return f"Could not sync with ZenMoney ({e}). Showing cached data."
+    return None
+
+
+def _freshness(db: Database, sync_warning: str | None) -> dict[str, Any]:
+    """Fields that tell the reader how current the answer is."""
+    last_sync = _last_sync_time(db)
+    info: dict[str, Any] = {
+        "data_synced_at": datetime.fromtimestamp(last_sync).isoformat() if last_sync else None,
+    }
+    if sync_warning:
+        info["sync_warning"] = sync_warning
+    return info
 
 
 # ============================================================================
@@ -136,7 +199,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "period": {
                         "type": "string",
-                        "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
+                        "description": PERIOD_DESCRIPTION,
                         "default": "this_month",
                     },
                     "start_date": {
@@ -183,7 +246,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "period": {
                         "type": "string",
-                        "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
+                        "description": PERIOD_DESCRIPTION,
                         "default": "this_month",
                     },
                     "start_date": {
@@ -210,7 +273,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "period": {
                         "type": "string",
-                        "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
+                        "description": PERIOD_DESCRIPTION,
                         "default": "this_month",
                     },
                     "start_date": {
@@ -315,7 +378,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "period": {
                         "type": "string",
-                        "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
+                        "description": PERIOD_DESCRIPTION,
                     },
                     "start_date": {
                         "type": "string",
@@ -337,7 +400,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "period": {
                         "type": "string",
-                        "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
+                        "description": PERIOD_DESCRIPTION,
                         "default": "this_month",
                     },
                     "top_n": {
@@ -356,7 +419,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "period": {
                         "type": "string",
-                        "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
+                        "description": PERIOD_DESCRIPTION,
                         "default": "this_month",
                     },
                     "start_date": {
@@ -445,7 +508,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "period": {
                         "type": "string",
-                        "description": "Period: 'this_month', 'last_month', 'last_30_days' or 'YYYY-MM'",
+                        "description": PERIOD_DESCRIPTION,
                     },
                     "start_date": {
                         "type": "string",
@@ -501,24 +564,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     db = get_db()
 
     if name == "sync_data":
-        engine = get_sync_engine()
-        force_full = arguments.get("force_full", False)
-        result = await engine.sync(force_full=force_full)
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+        result = await get_sync_engine().sync(force_full=arguments.get("force_full", False))
+    else:
+        sync_warning = await ensure_fresh(db)
+        result = await _run_tool(name, arguments, db)
+        result.update(_freshness(db, sync_warning))
 
-    elif name == "get_net_worth":
-        result = get_net_worth(db)
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+
+async def _run_tool(name: str, arguments: dict[str, Any], db: Database) -> dict[str, Any]:
+    """Run an analytics tool against the local cache."""
+    if name == "get_net_worth":
+        return get_net_worth(db)
 
     elif name == "get_liquidity":
-        result = get_liquidity(
+        return get_liquidity(
             db,
             target_amount=arguments.get("target_amount"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "analyze_spending":
-        result = analyze_spending(
+        return analyze_spending(
             db,
             period=arguments.get("period", "this_month"),
             category_id=arguments.get("category_id"),
@@ -529,20 +596,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             end_date=arguments.get("end_date"),
             group_by=arguments.get("group_by", "category"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "analyze_income":
-        result = analyze_income(
+        return analyze_income(
             db,
             period=arguments.get("period", "this_month"),
             top_n=arguments.get("top_n", 10),
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "analyze_merchants":
-        result = analyze_merchants(
+        return analyze_merchants(
             db,
             period=arguments.get("period", "this_month"),
             category_id=arguments.get("category_id"),
@@ -550,59 +615,52 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "check_budget_health":
-        result = check_budget_health(
+        return check_budget_health(
             db,
             month=arguments.get("month"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "get_upcoming_payments":
-        result = get_upcoming_payments(
+        return get_upcoming_payments(
             db,
             days_ahead=arguments.get("days_ahead", 30),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "analyze_trends":
-        result = analyze_trends(
+        return analyze_trends(
             db,
             months=arguments.get("months", 6),
             category_id=arguments.get("category_id"),
             metric=arguments.get("metric", "outcome"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "detect_recurring":
-        result = detect_recurring(
+        return detect_recurring(
             db,
             lookback_months=arguments.get("lookback_months", 3),
             tolerance_pct=arguments.get("tolerance_pct", 10),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "get_account_flow":
-        result = get_account_flow(
+        return get_account_flow(
             db,
             account_id=arguments.get("account_id"),
             period=arguments.get("period"),
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "analyze_transfers":
-        result = analyze_transfers(
+        return analyze_transfers(
             db,
             period=arguments.get("period", "this_month"),
             top_n=arguments.get("top_n", 15),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "detect_anomalies":
-        result = detect_anomalies(
+        return detect_anomalies(
             db,
             period=arguments.get("period", "this_month"),
             category_id=arguments.get("category_id"),
@@ -610,39 +668,34 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "get_debts":
-        result = get_debts(db)
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+        return get_debts(db)
 
     elif name == "suggest_category":
         engine = get_sync_engine()
-        result = await suggest_category(
+        return await suggest_category(
             payee=arguments.get("payee"),
             token=engine.token,
             db=db,
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "convert_currency":
-        result = convert_currency(
+        return convert_currency(
             db,
             amount=arguments.get("amount"),
             from_currency=arguments.get("from_currency"),
             to_currency=arguments.get("to_currency"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "get_exchange_rates":
-        result = get_exchange_rates(
+        return get_exchange_rates(
             db,
             currencies=arguments.get("currencies"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     elif name == "search_transactions":
-        result = search_transactions(
+        return search_transactions(
             db,
             period=arguments.get("period"),
             category_id=arguments.get("category_id"),
@@ -656,7 +709,6 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
         )
-        return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     else:
         raise ValueError(f"Unknown tool: {name}")
@@ -710,9 +762,11 @@ async def list_resources() -> list[Resource]:
 
 
 @server.read_resource()
-async def read_resource(uri: str) -> str:
+async def read_resource(uri: AnyUrl | str) -> str:
     """Read resource content."""
     db = get_db()
+    await ensure_fresh(db)
+    uri = str(uri)  # the SDK passes an AnyUrl, which never equals a str
 
     if uri == "zenmoney://accounts":
         result = get_accounts_resource(db)

@@ -63,6 +63,67 @@ class TestPeriodDates:
         assert end == "2026-02-28"
 
 
+class TestPeriodValidation:
+    """A period the server cannot parse must fail loudly, never fall back silently."""
+
+    def test_rejects_non_iso_start_date(self):
+        with pytest.raises(ValueError, match="start_date"):
+            get_period_dates("this_month", start_date="01.09.2026", end_date="30.09.2026")
+
+    def test_rejects_non_iso_end_date(self):
+        with pytest.raises(ValueError, match="end_date"):
+            get_period_dates("this_month", start_date="2026-09-01", end_date="30/09/2026")
+
+    def test_datetime_string_keeps_its_day(self):
+        start, end = get_period_dates(
+            "this_month", start_date="2026-09-01T00:00:00", end_date="2026-09-30T23:59:59"
+        )
+        assert (start, end) == ("2026-09-01", "2026-09-30")
+
+    def test_rejects_end_date_without_start_date(self):
+        with pytest.raises(ValueError, match="start_date"):
+            get_period_dates("this_month", end_date="2026-09-30")
+
+    def test_rejects_start_after_end(self):
+        with pytest.raises(ValueError, match="after"):
+            get_period_dates("this_month", start_date="2026-09-30", end_date="2026-09-01")
+
+    @pytest.mark.parametrize("period", ["September", "2026-13", "2026-1-1", "last_days", ""])
+    def test_rejects_unknown_period(self, period):
+        with pytest.raises(ValueError, match="Unknown period"):
+            get_period_dates(period)
+
+    def test_last_30_days_spans_exactly_30_days(self):
+        start, end = get_period_dates("last_30_days")
+        today = date.today()
+        assert end == today.isoformat()
+        assert start == (today - timedelta(days=29)).isoformat()
+
+    def test_last_n_days(self):
+        start, end = get_period_dates("last_7_days")
+        today = date.today()
+        assert (start, end) == ((today - timedelta(days=6)).isoformat(), today.isoformat())
+
+    def test_this_year(self):
+        year = date.today().year
+        assert get_period_dates("this_year") == (f"{year}-01-01", f"{year}-12-31")
+
+    def test_last_year(self):
+        year = date.today().year - 1
+        assert get_period_dates("last_year") == (f"{year}-01-01", f"{year}-12-31")
+
+    def test_yyyy_format(self):
+        assert get_period_dates("2024") == ("2024-01-01", "2024-12-31")
+
+    def test_leap_february(self):
+        assert get_period_dates("2024-02") == ("2024-02-01", "2024-02-29")
+
+    def test_malformed_dates_do_not_widen_the_query(self, populated_db: Database):
+        """'01.09.2026' used to compare as a string and return the whole history."""
+        with pytest.raises(ValueError, match="start_date"):
+            analyze_spending(populated_db, start_date="01.09.2026", end_date="30.09.2026")
+
+
 class TestT1GetNetWorth:
     """Test T1: get_net_worth tool."""
 
@@ -1646,6 +1707,35 @@ class TestSyncRetry:
     """Test sync retry and timeout behavior."""
 
     @pytest.mark.asyncio
+    async def test_first_sync_uses_300s_timeout(self, db: Database):
+        """An empty cache downloads the whole history, same as force_full."""
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        engine = SyncEngine(db, "test_token")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"serverTimestamp": 100}
+
+        captured_timeout = None
+
+        async def mock_post(*args, **kwargs):
+            nonlocal captured_timeout
+            captured_timeout = kwargs.get("timeout")
+            return mock_response
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = mock_post
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await engine.sync()
+
+        assert captured_timeout == 300.0
+
+    @pytest.mark.asyncio
     async def test_sync_force_full_retries_on_remote_protocol_error(self, db: Database):
         """BUG-001: force_full=True should retry on RemoteProtocolError."""
         import httpx
@@ -1714,6 +1804,7 @@ class TestSyncRetry:
         import httpx
         from unittest.mock import AsyncMock, patch, MagicMock
 
+        db.set_server_timestamp(50)  # the cache has synced before
         engine = SyncEngine(db, "test_token")
 
         mock_response = MagicMock()
