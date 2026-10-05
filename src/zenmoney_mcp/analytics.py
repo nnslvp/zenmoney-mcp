@@ -420,6 +420,7 @@ def analyze_spending(
     start_date: str | None = None,
     end_date: str | None = None,
     group_by: str = "category",
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze spending by categories.
 
@@ -429,18 +430,31 @@ def analyze_spending(
         db: Database instance.
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
         category_id: Optional category filter (includes children).
-        top_n: Number of top categories to return.
-        include_transfers: Include transfers in analysis.
+        top_n: Number of top categories to return (1-100).
+        include_transfers: Also count the outgoing side of transfers, currency
+            exchanges and debt operations. They add to the total and are reported
+            in "transfers_included", not under a category or merchant.
         include_holds: Include hold transactions.
         start_date: Optional explicit start date (ISO). Overrides period.
         end_date: Optional explicit end date (ISO). Used with start_date.
         group_by: Aggregation mode: "category" (default) or "merchant".
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded".
 
     Returns:
-        Dictionary with spending breakdown by categories.
+        Dictionary with spending breakdown by categories. Child categories are
+        folded into their parent and listed under its "subcategories"; with
+        category_id the category and its children come as a flat list.
+        Refunds (income on expense-only categories) do not reduce
+        "total_outcome"; they are reported in "refunds_total", "net_outcome"
+        and per category in "refunds".
     """
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
+    top_n = _clamp_top_n(top_n)
+    if group_by not in ("category", "merchant"):
+        raise ValueError(f"Unknown group_by {group_by!r}. Use 'category' or 'merchant'.")
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -454,40 +468,35 @@ def analyze_spending(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
-    # Build category filter if specified
-    category_ids = []
-    if category_id:
-        category_ids.append(category_id)
-        # Add children
-        children = conn.execute(
-            "SELECT id FROM tags WHERE parent = ?", (category_id,)
-        ).fetchall()
-        category_ids.extend(row["id"] for row in children)
+    # Build category filter if specified (the category and its children)
+    category_ids = _category_scope(db, category_id)
 
-    # Base query for expenses (get all, filter holds in Python to track excluded)
+    # Base query for expenses (get all, filter holds and off-balance accounts
+    # in Python to track what was excluded)
     query = """
         SELECT
             t.id,
             t.outcome,
             t.outcome_instrument,
+            t.income,
             t.tag,
             t.hold,
             t.merchant,
             t.payee,
-            m.title as merchant_title
+            m.title as merchant_title,
+            a.in_balance
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.outcome_account
         LEFT JOIN merchants m ON m.id = t.merchant
         WHERE t.deleted = 0
           AND t.date BETWEEN ? AND ?
           AND t.outcome > 0
-          AND t.income = 0
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
     """
     params: list[Any] = [start_date, end_date]
 
+    # Income on the other side marks a transfer, an exchange or a debt operation
     if not include_transfers:
-        query += " AND NOT (t.income > 0 AND t.outcome > 0)"
+        query += " AND t.income = 0"
 
     rows = conn.execute(query, params).fetchall()
 
@@ -495,6 +504,8 @@ def analyze_spending(
     category_totals: dict[str | None, dict[str, Any]] = {}
     merchant_totals: dict[str | None, dict[str, Any]] = {}
     holds_excluded = {"amount": 0.0, "count": 0}
+    off_balance_excluded = {"amount": 0.0, "count": 0}
+    transfers_included = {"amount": 0.0, "count": 0}
 
     for row in rows:
         # Filter holds in Python to track excluded amount
@@ -527,6 +538,19 @@ def analyze_spending(
             holds_excluded["count"] += 1
             continue
 
+        # Track off-balance accounts separately if not included
+        if row["in_balance"] == 0 and not include_off_balance:
+            off_balance_excluded["amount"] += amount
+            off_balance_excluded["count"] += 1
+            continue
+
+        # The outgoing side of a transfer counts towards the total, but it is
+        # neither a category nor a merchant
+        if row["income"] > 0:
+            transfers_included["amount"] += amount
+            transfers_included["count"] += 1
+            continue
+
         if primary_tag not in category_totals:
             category_totals[primary_tag] = {
                 "tag_id": primary_tag,
@@ -550,8 +574,29 @@ def analyze_spending(
         merchant_totals[merchant_key]["amount"] += amount
         merchant_totals[merchant_key]["count"] += 1
 
+    # Refunds are shown next to the spending they offset, not subtracted from it
+    refunds_total = 0.0
+    refunds = _refunds_by_tag(
+        db, start_date, end_date, include_off_balance, user_currency_id, user_rate
+    )
+    for tag_id, refunded in refunds.items():
+        if category_ids and tag_id not in category_ids:
+            continue
+        refunds_total += refunded
+        if tag_id not in category_totals:
+            category_totals[tag_id] = {
+                "tag_id": tag_id,
+                "amount": 0.0,
+                "count": 0,
+            }
+        category_totals[tag_id]["refunds"] = refunded
+
     # Calculate total
     total_outcome = sum(cat["amount"] for cat in category_totals.values())
+    total_outcome += transfers_included["amount"]
+    transfers_included["amount"] = round(transfers_included["amount"], 2)
+    holds_excluded["amount"] = round(holds_excluded["amount"], 2)
+    off_balance_excluded["amount"] = round(off_balance_excluded["amount"], 2)
 
     # If group_by == "merchant", return merchant aggregation
     if group_by == "merchant":
@@ -567,16 +612,23 @@ def analyze_spending(
             })
         merchants_list.sort(key=lambda x: x["amount"], reverse=True)
 
-        return {
+        result = {
             "period": {"start": start_date, "end": end_date},
             "total_outcome": round(total_outcome, 2),
+            "refunds_total": round(refunds_total, 2),
+            "net_outcome": round(total_outcome - refunds_total, 2),
             "currency": currency_code,
             "group_by": "merchant",
             "merchants": merchants_list[:top_n],
             "returned_count": min(len(merchants_list), top_n),
             "total_merchants": len(merchants_list),
             "holds_excluded": holds_excluded if holds_excluded["count"] > 0 else None,
+            "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
         }
+        if include_transfers:
+            result["transfers_included"] = transfers_included
+
+        return result
 
     # Get category names and parent info
     tag_info = {}
@@ -606,23 +658,55 @@ def analyze_spending(
 
     # Calculate percentages
     categories = []
-    for tag_id, data in category_totals.items():
-        info = tag_info.get(tag_id, {})
-        name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
-        parent_title = info.get("parent_title")
+    if category_id:
+        # Drill-down: the category and its children as a flat list
+        for tag_id, data in category_totals.items():
+            info = tag_info.get(tag_id, {})
+            name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
+            parent_title = info.get("parent_title")
 
-        cat_data = {
-            "tag_id": tag_id,
-            "name": name,
-            "amount": round(data["amount"], 2),
-            "share_pct": round(data["amount"] / total_outcome * 100, 1) if total_outcome > 0 else 0,
-            "count": data["count"],
-            "avg_check": round(data["amount"] / data["count"], 2) if data["count"] > 0 else 0,
-        }
-        if parent_title:
-            cat_data["parent_category"] = parent_title
+            cat_data = {
+                "tag_id": tag_id,
+                "name": name,
+                "amount": round(data["amount"], 2),
+                "share_pct": round(data["amount"] / total_outcome * 100, 1) if total_outcome > 0 else 0,
+                "count": data["count"],
+                "avg_check": round(data["amount"] / data["count"], 2) if data["count"] > 0 else 0,
+            }
+            if parent_title:
+                cat_data["parent_category"] = parent_title
+            if data.get("refunds"):
+                cat_data["refunds"] = round(data["refunds"], 2)
 
-        categories.append(cat_data)
+            categories.append(cat_data)
+    else:
+        # Overview: children are folded into their parent category
+        for top in _fold_into_parents(category_totals, tag_info):
+            cat_data = {
+                "tag_id": top["tag_id"],
+                "name": top["name"],
+                "amount": round(top["amount"], 2),
+                "share_pct": round(top["amount"] / total_outcome * 100, 1) if total_outcome > 0 else 0,
+                "count": top["count"],
+                "avg_check": round(top["amount"] / top["count"], 2) if top["count"] > 0 else 0,
+            }
+            if top["refunds"]:
+                cat_data["refunds"] = round(top["refunds"], 2)
+
+            subcategories = []
+            for part in top["parts"]:
+                line = {
+                    "tag_id": part["tag_id"],
+                    "name": part["name"],
+                    "amount": round(part["amount"], 2),
+                    "count": part["count"],
+                }
+                if part["refunds"]:
+                    line["refunds"] = round(part["refunds"], 2)
+                subcategories.append(line)
+            cat_data["subcategories"] = subcategories
+
+            categories.append(cat_data)
 
     # Sort by amount and limit
     categories.sort(key=lambda x: x["amount"], reverse=True)
@@ -639,13 +723,18 @@ def analyze_spending(
     result = {
         "period": {"start": start_date, "end": end_date},
         "total_outcome": round(total_outcome, 2),
+        "refunds_total": round(refunds_total, 2),
+        "net_outcome": round(total_outcome - refunds_total, 2),
         "currency": currency_code,
         "categories": categorized[:top_n],
         "returned_count": min(len(categorized), top_n),
         "total_categories": len(categorized),
         "uncategorized": uncategorized,
         "holds_excluded": holds_excluded if holds_excluded["count"] > 0 else None,
+        "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
     }
+    if include_transfers:
+        result["transfers_included"] = transfers_included
 
     # Add top_merchants when in drill-down mode (category_id is set)
     if category_id and merchant_totals:
@@ -663,12 +752,157 @@ def analyze_spending(
     return result
 
 
+_REPORT_TOP_N_MAX = 100
+
+
+def _count_arg(value: Any, name: str) -> int:
+    """Return ``value`` as an integer >= 1.
+
+    JSON has a single number type, so a whole number sent as a float (10.0) is accepted.
+
+    Raises:
+        ValueError: If ``value`` is anything else.
+    """
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+    return value
+
+
+def _clamp_top_n(top_n: int) -> int:
+    """Validate ``top_n`` and cap it at ``_REPORT_TOP_N_MAX`` entries.
+
+    Raises:
+        ValueError: If ``top_n`` is not an integer >= 1.
+    """
+    return min(_count_arg(top_n, "top_n"), _REPORT_TOP_N_MAX)
+
+
+def _category_scope(db: Database, category_id: str | None) -> list[str]:
+    """Tag IDs a category filter covers: the category and its children.
+
+    Returns an empty list when no filter is set.
+
+    Raises:
+        ValueError: If the category does not exist.
+    """
+    if not category_id:
+        return []
+
+    conn = db.connect()
+    if not conn.execute("SELECT 1 FROM tags WHERE id = ?", (category_id,)).fetchone():
+        raise ValueError(
+            f"Unknown category {category_id!r}. "
+            "Category IDs are listed in the zenmoney://categories resource."
+        )
+    children = conn.execute(
+        "SELECT id FROM tags WHERE parent = ?", (category_id,)
+    ).fetchall()
+    return [category_id] + [row["id"] for row in children]
+
+
+def _fold_into_parents(
+    category_totals: dict[str | None, dict[str, Any]],
+    tag_info: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fold per-tag totals into top-level categories.
+
+    A child category adds its amount, count and refunds to its parent. "parts"
+    lists what an entry was built from, largest first: the children and, when
+    the parent has transactions of its own, the parent itself. It is empty when
+    there is nothing to break down (no children involved).
+
+    ``tag_info`` maps a tag to its "title", "parent" and "parent_title".
+    """
+    top_level: dict[str | None, dict[str, Any]] = {}
+
+    for tag_id, data in category_totals.items():
+        info = tag_info.get(tag_id, {})
+        name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
+        if info.get("parent_title"):
+            top_id, top_name = info["parent"], info["parent_title"]
+        else:
+            top_id, top_name = tag_id, name
+
+        if top_id not in top_level:
+            top_level[top_id] = {
+                "tag_id": top_id,
+                "name": top_name,
+                "amount": 0.0,
+                "count": 0,
+                "refunds": 0.0,
+                "parts": [],
+            }
+        top = top_level[top_id]
+        top["amount"] += data["amount"]
+        top["count"] += data["count"]
+        top["refunds"] += data.get("refunds", 0.0)
+        top["parts"].append({
+            "tag_id": tag_id,
+            "name": name,
+            "amount": data["amount"],
+            "count": data["count"],
+            "refunds": data.get("refunds", 0.0),
+        })
+
+    for top in top_level.values():
+        if all(part["tag_id"] == top["tag_id"] for part in top["parts"]):
+            top["parts"] = []
+        top["parts"].sort(key=lambda x: x["amount"], reverse=True)
+
+    return list(top_level.values())
+
+
+def _refunds_by_tag(
+    db: Database,
+    start_date: str,
+    end_date: str,
+    include_off_balance: bool,
+    user_currency_id: int,
+    user_rate: float,
+) -> dict[str, float]:
+    """Refunds per category in user currency.
+
+    A refund is income recorded on an expense-only category (show_outcome
+    without show_income). The rows are picked by the rules of analyze_income:
+    pure income, no holds, off-balance accounts only on request.
+    """
+    query = """
+        SELECT t.income, t.income_instrument, g.id as tag_id
+        FROM transactions t
+        JOIN tags g ON g.id = json_extract(t.tag, '$[0]')
+        LEFT JOIN accounts a ON a.id = t.income_account
+        WHERE t.deleted = 0
+          AND (t.hold IS NULL OR t.hold = 0)
+          AND t.date BETWEEN ? AND ?
+          AND t.income > 0
+          AND t.outcome = 0
+          AND g.show_outcome = 1
+          AND g.show_income = 0
+    """
+    if not include_off_balance:
+        query += " AND (a.in_balance = 1 OR a.in_balance IS NULL)"
+
+    refunds: dict[str, float] = {}
+    for row in db.connect().execute(query, (start_date, end_date)).fetchall():
+        amount = row["income"]
+        instrument_id = row["income_instrument"]
+        if instrument_id and instrument_id != user_currency_id:
+            source_rate = db.get_instrument_rate(instrument_id)
+            amount = amount * source_rate / user_rate if user_rate else amount
+        refunds[row["tag_id"]] = refunds.get(row["tag_id"], 0.0) + amount
+
+    return refunds
+
+
 def analyze_income(
     db: Database,
     period: str = "this_month",
     top_n: int = 10,
     start_date: str | None = None,
     end_date: str | None = None,
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze income by categories and sources.
 
@@ -677,15 +911,23 @@ def analyze_income(
     Args:
         db: Database instance.
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
-        top_n: Number of top categories/sources to return.
+        top_n: Number of top categories/sources to return (1-100).
         start_date: Optional explicit start date (ISO). Overrides period.
         end_date: Optional explicit end date (ISO). Used with start_date.
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded".
 
     Returns:
-        Dictionary with income breakdown by categories and sources.
+        Dictionary with income breakdown by categories and sources. Child
+        categories are folded into their parent and listed under its
+        "subcategories". Refunds (income on expense-only categories) stay in
+        "total_income"; their categories are marked "is_refund" and summed in
+        "refunds_total".
     """
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
+    top_n = _clamp_top_n(top_n)
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -699,7 +941,8 @@ def analyze_income(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
-    # Query for income transactions (pure income only, no transfers)
+    # Query for income transactions (pure income only, no transfers;
+    # off-balance accounts are filtered in Python to track what was excluded)
     query = """
         SELECT
             t.id,
@@ -708,7 +951,8 @@ def analyze_income(
             t.tag,
             t.merchant,
             t.payee,
-            t.original_payee
+            t.original_payee,
+            a.in_balance
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.income_account
         WHERE t.deleted = 0
@@ -716,7 +960,6 @@ def analyze_income(
           AND t.date BETWEEN ? AND ?
           AND t.income > 0
           AND t.outcome = 0
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
     """
     params: list[Any] = [start_date, end_date]
 
@@ -726,6 +969,7 @@ def analyze_income(
     category_totals: dict[str | None, dict[str, Any]] = {}
     # Aggregate by source (merchant/payee)
     source_totals: dict[str, dict[str, Any]] = {}
+    off_balance_excluded = {"amount": 0.0, "count": 0}
 
     for row in rows:
         # Parse primary tag
@@ -745,6 +989,12 @@ def analyze_income(
         if instrument_id and instrument_id != user_currency_id:
             source_rate = db.get_instrument_rate(instrument_id)
             amount = amount * source_rate / user_rate if user_rate else amount
+
+        # Track off-balance accounts separately if not included
+        if row["in_balance"] == 0 and not include_off_balance:
+            off_balance_excluded["amount"] += amount
+            off_balance_excluded["count"] += 1
+            continue
 
         # Aggregate by category
         if primary_tag not in category_totals:
@@ -768,18 +1018,31 @@ def analyze_income(
         source_totals[source_key]["amount"] += amount
         source_totals[source_key]["count"] += 1
 
-    # Get category names
+    # Get category names and parent info
     tag_info = {}
     if category_totals:
         tag_ids = [t for t in category_totals.keys() if t]
         if tag_ids:
             placeholders = ",".join("?" * len(tag_ids))
             tag_rows = conn.execute(
-                f"SELECT id, title, parent FROM tags WHERE id IN ({placeholders})",
+                f"""
+                SELECT t.id, t.title, t.parent, p.title as parent_title,
+                       t.show_income, t.show_outcome
+                FROM tags t
+                LEFT JOIN tags p ON p.id = t.parent
+                WHERE t.id IN ({placeholders})
+                """,
                 tag_ids
             ).fetchall()
             for tr in tag_rows:
-                tag_info[tr["id"]] = {"title": tr["title"], "parent": tr["parent"]}
+                tag_info[tr["id"]] = {
+                    "title": tr["title"],
+                    "parent": tr["parent"],
+                    "parent_title": tr["parent_title"],
+                }
+                # Income on an expense-only category is money coming back, not earnings
+                if tr["show_outcome"] == 1 and tr["show_income"] == 0:
+                    category_totals[tr["id"]]["refunds"] = category_totals[tr["id"]]["amount"]
 
     # Get merchant names
     merchant_ids = [s["merchant_id"] for s in source_totals.values() if s["merchant_id"]]
@@ -795,19 +1058,36 @@ def analyze_income(
     # Calculate totals
     total_income = sum(cat["amount"] for cat in category_totals.values())
 
-    # Format categories
+    # Format categories (children are folded into their parent category)
     categories = []
-    for tag_id, data in category_totals.items():
-        info = tag_info.get(tag_id, {})
-        name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
+    refunds_total = 0.0
+    for top in _fold_into_parents(category_totals, tag_info):
+        cat_data = {
+            "tag_id": top["tag_id"],
+            "name": top["name"],
+            "amount": round(top["amount"], 2),
+            "share_pct": round(top["amount"] / total_income * 100, 1) if total_income > 0 else 0,
+            "count": top["count"],
+        }
+        # A refund category: everything in it came back from purchases
+        if top["refunds"] and all(part["refunds"] for part in top["parts"]):
+            cat_data["is_refund"] = True
+        refunds_total += top["refunds"]
 
-        categories.append({
-            "tag_id": tag_id,
-            "name": name,
-            "amount": round(data["amount"], 2),
-            "share_pct": round(data["amount"] / total_income * 100, 1) if total_income > 0 else 0,
-            "count": data["count"],
-        })
+        subcategories = []
+        for part in top["parts"]:
+            line = {
+                "tag_id": part["tag_id"],
+                "name": part["name"],
+                "amount": round(part["amount"], 2),
+                "count": part["count"],
+            }
+            if part["refunds"]:
+                line["is_refund"] = True
+            subcategories.append(line)
+        cat_data["subcategories"] = subcategories
+
+        categories.append(cat_data)
 
     categories.sort(key=lambda x: x["amount"], reverse=True)
 
@@ -828,10 +1108,13 @@ def analyze_income(
         })
 
     sources.sort(key=lambda x: x["amount"], reverse=True)
+    off_balance_excluded["amount"] = round(off_balance_excluded["amount"], 2)
 
     return {
         "period": {"start": start_date, "end": end_date},
         "total_income": round(total_income, 2),
+        "refunds_total": round(refunds_total, 2),
+        "income_excluding_refunds": round(total_income - refunds_total, 2),
         "currency": currency_code,
         "categories": categories[:top_n],
         "sources": sources[:top_n],
@@ -839,6 +1122,7 @@ def analyze_income(
         "total_categories": len(categories),
         "returned_sources": min(len(sources), top_n),
         "total_sources": len(sources),
+        "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
     }
 
 
@@ -1178,6 +1462,7 @@ def analyze_merchants(
     top_n: int = 10,
     start_date: str | None = None,
     end_date: str | None = None,
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze spending by merchants/payees.
 
@@ -1187,15 +1472,19 @@ def analyze_merchants(
         db: Database instance.
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
         category_id: Optional category filter (includes children).
-        top_n: Number of top merchants to return.
+        top_n: Number of top merchants to return (1-100).
         start_date: Optional explicit start date (ISO). Overrides period.
         end_date: Optional explicit end date (ISO). Used with start_date.
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded".
 
     Returns:
         Dictionary with spending breakdown by merchants.
     """
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
+    top_n = _clamp_top_n(top_n)
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -1209,17 +1498,11 @@ def analyze_merchants(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
-    # Build category filter if specified
-    category_ids = []
-    if category_id:
-        category_ids.append(category_id)
-        # Add children
-        children = conn.execute(
-            "SELECT id FROM tags WHERE parent = ?", (category_id,)
-        ).fetchall()
-        category_ids.extend(row["id"] for row in children)
+    # Build category filter if specified (the category and its children)
+    category_ids = _category_scope(db, category_id)
 
-    # Query for expense transactions
+    # Query for expense transactions (off-balance accounts are filtered
+    # in Python to track what was excluded)
     query = """
         SELECT
             t.id,
@@ -1229,7 +1512,8 @@ def analyze_merchants(
             t.tag,
             t.merchant,
             t.payee,
-            m.title as merchant_title
+            m.title as merchant_title,
+            a.in_balance
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.outcome_account
         LEFT JOIN merchants m ON m.id = t.merchant
@@ -1239,7 +1523,6 @@ def analyze_merchants(
           AND NOT (t.income > 0 AND t.outcome > 0)
           AND t.outcome > 0
           AND t.income = 0
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
     """
     params: list[Any] = [start_date, end_date]
 
@@ -1247,6 +1530,7 @@ def analyze_merchants(
 
     # Aggregate by merchant
     merchant_totals: dict[str, dict[str, Any]] = {}
+    off_balance_excluded = {"amount": 0.0, "count": 0}
 
     for row in rows:
         # Filter by category if specified
@@ -1270,6 +1554,12 @@ def analyze_merchants(
         if instrument_id and instrument_id != user_currency_id:
             source_rate = db.get_instrument_rate(instrument_id)
             amount = amount * source_rate / user_rate if user_rate else amount
+
+        # Track off-balance accounts separately if not included
+        if row["in_balance"] == 0 and not include_off_balance:
+            off_balance_excluded["amount"] += amount
+            off_balance_excluded["count"] += 1
+            continue
 
         # Determine merchant key (merchant_id or payee)
         merchant_id = row["merchant"]
@@ -1313,6 +1603,7 @@ def analyze_merchants(
 
     # Sort by total amount and limit
     merchants.sort(key=lambda x: x["total"], reverse=True)
+    off_balance_excluded["amount"] = round(off_balance_excluded["amount"], 2)
 
     return {
         "period": {"start": start_date, "end": end_date},
@@ -1321,6 +1612,7 @@ def analyze_merchants(
         "merchants": merchants[:top_n],
         "returned_count": min(len(merchants), top_n),
         "total_merchants": len(merchants),
+        "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
     }
 
 
@@ -1621,6 +1913,7 @@ def analyze_trends(
     months: int = 6,
     category_id: str | None = None,
     metric: str = "outcome",
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze spending/income trends over time.
 
@@ -1628,14 +1921,26 @@ def analyze_trends(
 
     Args:
         db: Database instance.
-        months: Number of months to analyze (default 6).
+        months: Number of months to analyze, the current one included (default 6).
+            Months before the first transaction are omitted.
         category_id: Optional category filter.
         metric: Metric to track ("outcome", "income", "savings_rate", "net_cashflow").
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded" (split into "outcome" and "income" for
+            "savings_rate" and "net_cashflow").
 
     Returns:
-        Dictionary with monthly data and trend analysis.
+        Dictionary with monthly data and trend analysis. The statistics cover
+        complete months with a defined value; with fewer than 2 of them the
+        summary holds a single month's value and a note instead.
     """
     conn = db.connect()
+    months = _count_arg(months, "months")
+    if metric not in ("outcome", "income", "savings_rate", "net_cashflow"):
+        raise ValueError(
+            f"Unknown metric {metric!r}. Use 'outcome', 'income', 'savings_rate' or 'net_cashflow'."
+        )
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -1649,14 +1954,36 @@ def analyze_trends(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
+    # Build category filter if specified (the category and its children)
+    category_ids = _category_scope(db, category_id)
+
     # Calculate month range
     today = date.today()
     current_month_start = today.replace(day=1)
 
-    monthly_data = []
-    values = []
+    # Months before the first transaction hold no data. Shown as zeros they would
+    # drag the statistics down, so the series starts where the history starts
+    first_date = conn.execute(
+        "SELECT MIN(date) AS first_date FROM transactions WHERE deleted = 0"
+    ).fetchone()["first_date"]
+    history_months = 0
+    if first_date:
+        history_start = parse_iso_date(first_date, "transaction date")
+        history_months = (
+            (today.year - history_start.year) * 12 + today.month - history_start.month + 1
+        )
+    months_shown = max(0, min(months, history_months))
 
-    for i in range(months - 1, -1, -1):
+    monthly_data = []
+    # Complete months with a defined value: the basis of the statistics
+    values = []
+    value_months = []
+    value_positions = []
+    complete_months = 0
+    off_balance_outcome = {"amount": 0.0, "count": 0}
+    off_balance_income = {"amount": 0.0, "count": 0}
+
+    for i in range(months_shown - 1, -1, -1):
         # Calculate month start
         month_offset = i
         if current_month_start.month > month_offset:
@@ -1677,18 +2004,10 @@ def analyze_trends(
         month_key = month_start.strftime("%Y-%m")
         is_partial = (month_start.year == today.year and month_start.month == today.month)
 
-        # Build category filter
-        category_ids = []
-        if category_id:
-            category_ids.append(category_id)
-            children = conn.execute(
-                "SELECT id FROM tags WHERE parent = ?", (category_id,)
-            ).fetchall()
-            category_ids.extend(row["id"] for row in children)
-
-        # Calculate outcome for this month
+        # Calculate outcome for this month (off-balance accounts are filtered
+        # in Python to track what was excluded)
         outcome_query = """
-            SELECT t.outcome, t.outcome_instrument
+            SELECT t.outcome, t.outcome_instrument, a.in_balance
             FROM transactions t
             LEFT JOIN accounts a ON a.id = t.outcome_account
             WHERE t.deleted = 0
@@ -1697,7 +2016,6 @@ def analyze_trends(
               AND t.outcome > 0
               AND t.income = 0
               AND t.date >= ? AND t.date <= ?
-              AND (a.in_balance = 1 OR a.in_balance IS NULL)
         """
         outcome_params: list[Any] = [month_start.isoformat(), month_end.isoformat()]
 
@@ -1714,12 +2032,16 @@ def analyze_trends(
             if instrument_id and instrument_id != user_currency_id:
                 source_rate = db.get_instrument_rate(instrument_id)
                 amount = amount * source_rate / user_rate if user_rate else amount
+            if row["in_balance"] == 0 and not include_off_balance:
+                off_balance_outcome["amount"] += amount
+                off_balance_outcome["count"] += 1
+                continue
             total_outcome += amount
 
         # Calculate income for this month (if needed for metric)
         if metric in ("income", "savings_rate", "net_cashflow"):
             income_query = """
-                SELECT t.income, t.income_instrument
+                SELECT t.income, t.income_instrument, a.in_balance
                 FROM transactions t
                 LEFT JOIN accounts a ON a.id = t.income_account
                 WHERE t.deleted = 0
@@ -1727,7 +2049,6 @@ def analyze_trends(
                   AND t.income > 0
                   AND t.outcome = 0
                   AND t.date >= ? AND t.date <= ?
-                  AND (a.in_balance = 1 OR a.in_balance IS NULL)
             """
             income_params: list[Any] = [month_start.isoformat(), month_end.isoformat()]
 
@@ -1744,6 +2065,10 @@ def analyze_trends(
                 if instrument_id and instrument_id != user_currency_id:
                     source_rate = db.get_instrument_rate(instrument_id)
                     amount = amount * source_rate / user_rate if user_rate else amount
+                if row["in_balance"] == 0 and not include_off_balance:
+                    off_balance_income["amount"] += amount
+                    off_balance_income["count"] += 1
+                    continue
                 total_income += amount
         else:
             total_income = 0.0
@@ -1754,61 +2079,59 @@ def analyze_trends(
         elif metric == "income":
             value = total_income
         elif metric == "savings_rate":
-            value = ((total_income - total_outcome) / total_income * 100) if total_income > 0 else 0
-        elif metric == "net_cashflow":
+            # Undefined without income: 0 % would claim that nothing was overspent
+            value = ((total_income - total_outcome) / total_income * 100) if total_income > 0 else None
+        else:  # net_cashflow
             value = total_income - total_outcome
-        else:
-            value = total_outcome
 
         month_data = {
             "month": month_key,
-            "value": round(value, 2),
+            "value": round(value, 2) if value is not None else None,
         }
         if is_partial:
             month_data["partial"] = True
 
         monthly_data.append(month_data)
         if not is_partial:  # Don't include partial month in trend calculation
-            values.append(value)
+            if value is not None:
+                values.append(value)
+                value_months.append(month_key)
+                value_positions.append(complete_months)
+            complete_months += 1
 
     # Calculate statistics
-    if values:
+    if len(values) >= 2:
         avg_value = sum(values) / len(values)
         min_value = min(values)
         max_value = max(values)
 
-        # Find min/max months
-        min_month = next((m for m in monthly_data if m["value"] == min_value), None)
-        max_month = next((m for m in monthly_data if m["value"] == max_value), None)
+        # Find min/max months (the values are unrounded, so look them up by position)
+        min_month = value_months[values.index(min_value)]
+        max_month = value_months[values.index(max_value)]
 
         # Calculate trend direction (simple linear regression slope)
-        if len(values) >= 2:
-            n = len(values)
-            x_values = list(range(n))
-            x_mean = sum(x_values) / n
-            y_mean = avg_value
+        n = len(values)
+        x_values = value_positions  # month positions, so a skipped month keeps its gap
+        x_mean = sum(x_values) / n
+        y_mean = avg_value
 
-            numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, values))
-            denominator = sum((x - x_mean) ** 2 for x in x_values)
+        numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, values))
+        denominator = sum((x - x_mean) ** 2 for x in x_values)
+        slope = numerator / denominator
 
-            if denominator != 0:
-                slope = numerator / denominator
-                pct_change_per_month = (slope / y_mean * 100) if y_mean != 0 else 0
-
-                if abs(pct_change_per_month) < 2:
-                    trend_direction = "stable"
-                elif pct_change_per_month > 0:
-                    trend_direction = "rising"
-                else:
-                    trend_direction = "falling"
-            else:
-                slope = 0
-                pct_change_per_month = 0
-                trend_direction = "stable"
+        # Relative to the size of the average: a negative average must not flip
+        # the sign, and around a zero average a percentage is undefined
+        if round(y_mean, 2) != 0:
+            pct_change_per_month = slope / abs(y_mean) * 100
         else:
-            slope = 0
-            pct_change_per_month = 0
+            pct_change_per_month = None
+
+        if slope == 0 or (pct_change_per_month is not None and abs(pct_change_per_month) < 2):
             trend_direction = "stable"
+        elif slope > 0:
+            trend_direction = "rising"
+        else:
+            trend_direction = "falling"
 
         # Detect anomalies (values > 2 standard deviations from mean)
         if len(values) >= 3:
@@ -1817,33 +2140,47 @@ def analyze_trends(
 
             anomalies = []
             for month_data in monthly_data:
-                if month_data.get("partial"):
+                if month_data.get("partial") or month_data["value"] is None:
                     continue
                 value = month_data["value"]
                 if abs(value - avg_value) > 2 * stddev:
-                    deviation_pct = ((value - avg_value) / avg_value * 100) if avg_value != 0 else 0
+                    if round(avg_value, 2) != 0:
+                        deviation = f"{(value - avg_value) / abs(avg_value) * 100:+.1f}%"
+                    else:
+                        deviation = None
                     anomalies.append({
                         "month": month_data["month"],
                         "value": value,
-                        "deviation": f"{deviation_pct:+.1f}%",
+                        "deviation": deviation,
                     })
         else:
             anomalies = []
 
         summary = {
             "average": round(avg_value, 2),
-            "min": {"month": min_month["month"] if min_month else None, "value": round(min_value, 2)},
-            "max": {"month": max_month["month"] if max_month else None, "value": round(max_value, 2)},
+            "min": {"month": min_month, "value": round(min_value, 2)},
+            "max": {"month": max_month, "value": round(max_value, 2)},
             "trend_direction": trend_direction,
-            "trend_pct_change_per_month": round(pct_change_per_month, 1),
+            "trend_pct_change_per_month": (
+                round(pct_change_per_month, 1) if pct_change_per_month is not None else None
+            ),
         }
 
         if anomalies:
             summary["anomalies"] = anomalies
     else:
-        summary = {
-            "message": "Insufficient data for analysis"
-        }
+        # A single month is no trend: report its value (a complete month if there is one)
+        defined = [m for m in monthly_data if m["value"] is not None]
+        complete = [m for m in defined if not m.get("partial")]
+        if defined:
+            summary = {
+                **(complete or defined)[-1],
+                "note": "A trend needs at least 2 complete months of data",
+            }
+        else:
+            summary = {
+                "message": "Insufficient data for analysis"
+            }
 
     # Get category name if specified
     category_name = None
@@ -1852,13 +2189,34 @@ def analyze_trends(
         if cat_row:
             category_name = cat_row["title"]
 
-    return {
+    # What the off-balance filter left out, for the sides the metric is built from
+    off_balance_outcome["amount"] = round(off_balance_outcome["amount"], 2)
+    off_balance_income["amount"] = round(off_balance_income["amount"], 2)
+    if metric == "income":
+        off_balance_excluded = off_balance_income if off_balance_income["count"] > 0 else None
+    elif metric in ("savings_rate", "net_cashflow"):
+        if off_balance_outcome["count"] > 0 or off_balance_income["count"] > 0:
+            off_balance_excluded = {"outcome": off_balance_outcome, "income": off_balance_income}
+        else:
+            off_balance_excluded = None
+    else:
+        off_balance_excluded = off_balance_outcome if off_balance_outcome["count"] > 0 else None
+
+    result = {
         "metric": metric,
         "category": category_name,
         "currency": currency_code if metric in ("outcome", "income", "net_cashflow") else None,
         "data": monthly_data,
         "summary": summary,
+        "off_balance_excluded": off_balance_excluded,
     }
+    if first_date and months_shown < months:
+        result["note"] = (
+            f"No transactions before {history_start:%Y-%m}: "
+            f"{months - months_shown} of the {months} requested months are omitted"
+        )
+
+    return result
 
 
 def get_upcoming_payments(

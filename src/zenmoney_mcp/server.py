@@ -217,17 +217,24 @@ async def list_tools() -> list[Tool]:
                     },
                     "top_n": {
                         "type": "integer",
-                        "description": "Number of top categories to return",
+                        "description": "Number of top categories to return (1-100)",
                         "default": 10,
+                        "minimum": 1,
+                        "maximum": 100,
                     },
                     "include_transfers": {
                         "type": "boolean",
-                        "description": "Include transfers between own accounts",
+                        "description": "Also count the outgoing side of transfers between own accounts, currency exchanges and debt operations (added to the total, reported in transfers_included)",
                         "default": False,
                     },
                     "include_holds": {
                         "type": "boolean",
                         "description": "Include hold transactions (pre-authorizations)",
+                        "default": False,
+                    },
+                    "include_off_balance": {
+                        "type": "boolean",
+                        "description": "Include off-balance accounts. Excluded by default, as in ZenMoney's reports; the amount left out is reported in off_balance_excluded",
                         "default": False,
                     },
                     "group_by": {
@@ -258,10 +265,17 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Custom end date (ISO). If omitted with start_date, defaults to today.",
                     },
+                    "include_off_balance": {
+                        "type": "boolean",
+                        "description": "Include off-balance accounts. Excluded by default, as in ZenMoney's reports; the amount left out is reported in off_balance_excluded",
+                        "default": False,
+                    },
                     "top_n": {
                         "type": "integer",
-                        "description": "Number of top categories/sources to return",
+                        "description": "Number of top categories/sources to return (1-100)",
                         "default": 10,
+                        "minimum": 1,
+                        "maximum": 100,
                     },
                 },
             },
@@ -289,10 +303,17 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Category UUID to filter (includes subcategories)",
                     },
+                    "include_off_balance": {
+                        "type": "boolean",
+                        "description": "Include off-balance accounts. Excluded by default, as in ZenMoney's reports; the amount left out is reported in off_balance_excluded",
+                        "default": False,
+                    },
                     "top_n": {
                         "type": "integer",
-                        "description": "Number of top merchants to return",
+                        "description": "Number of top merchants to return (1-100)",
                         "default": 10,
+                        "minimum": 1,
+                        "maximum": 100,
                     },
                 },
             },
@@ -332,12 +353,18 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "months": {
                         "type": "integer",
-                        "description": "Number of months to analyze",
+                        "description": "Number of months to analyze, the current (partial) month included",
                         "default": 6,
+                        "minimum": 1,
                     },
                     "category_id": {
                         "type": "string",
                         "description": "Category UUID to filter",
+                    },
+                    "include_off_balance": {
+                        "type": "boolean",
+                        "description": "Include off-balance accounts. Excluded by default, as in ZenMoney's reports; the amount left out is reported in off_balance_excluded",
+                        "default": False,
                     },
                     "metric": {
                         "type": "string",
@@ -599,6 +626,7 @@ async def _run_tool(name: str, arguments: dict[str, Any], db: Database) -> dict[
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
             group_by=arguments.get("group_by", "category"),
+            include_off_balance=arguments.get("include_off_balance", False),
         )
 
     elif name == "analyze_income":
@@ -608,6 +636,7 @@ async def _run_tool(name: str, arguments: dict[str, Any], db: Database) -> dict[
             top_n=arguments.get("top_n", 10),
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
+            include_off_balance=arguments.get("include_off_balance", False),
         )
 
     elif name == "analyze_merchants":
@@ -618,6 +647,7 @@ async def _run_tool(name: str, arguments: dict[str, Any], db: Database) -> dict[
             top_n=arguments.get("top_n", 10),
             start_date=arguments.get("start_date"),
             end_date=arguments.get("end_date"),
+            include_off_balance=arguments.get("include_off_balance", False),
         )
 
     elif name == "check_budget_health":
@@ -638,6 +668,7 @@ async def _run_tool(name: str, arguments: dict[str, Any], db: Database) -> dict[
             months=arguments.get("months", 6),
             category_id=arguments.get("category_id"),
             metric=arguments.get("metric", "outcome"),
+            include_off_balance=arguments.get("include_off_balance", False),
         )
 
     elif name == "detect_recurring":

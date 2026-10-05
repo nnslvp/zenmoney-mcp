@@ -349,17 +349,22 @@ class TestT3AnalyzeSpending:
 
         categories = {c["name"]: c for c in result["categories"]}
 
-        # Продукты: tx1 (1500) - child of Еда
-        # Рестораны: tx2 (3000) - child of Еда
+        # Еда: its children are folded into it
+        #   Продукты: tx1 (1500)
+        #   Рестораны: tx2 (3000)
         # Транспорт: tx3 (500)
         # tx4 (200) - uncategorized
 
-        assert "Продукты" in categories
-        assert categories["Продукты"]["amount"] == 1500.0
-        assert categories["Продукты"]["count"] == 1
+        assert categories["Еда"]["amount"] == 4500.0
+        assert categories["Еда"]["count"] == 2
+        subcategories = {s["name"]: s for s in categories["Еда"]["subcategories"]}
 
-        assert "Рестораны" in categories
-        assert categories["Рестораны"]["amount"] == 3000.0
+        assert "Продукты" in subcategories
+        assert subcategories["Продукты"]["amount"] == 1500.0
+        assert subcategories["Продукты"]["count"] == 1
+
+        assert "Рестораны" in subcategories
+        assert subcategories["Рестораны"]["amount"] == 3000.0
 
         assert "Транспорт" in categories
         assert categories["Транспорт"]["amount"] == 500.0
@@ -379,7 +384,7 @@ class TestT3AnalyzeSpending:
         for cat in result["categories"]:
             # Name should be human-readable, not UUID
             assert not cat["name"].startswith("tag-")
-            assert cat["name"] in ["Продукты", "Рестораны", "Транспорт"]
+            assert cat["name"] in ["Еда", "Транспорт"]
 
 
 class TestT4AnalyzeIncome:
@@ -748,8 +753,8 @@ class TestT8AnalyzeTrends:
         """Test that data contains monthly entries."""
         result = analyze_trends(populated_db, months=3)
 
-        # Should have 3 months of data
-        assert len(result["data"]) == 3
+        # The fixture's history starts this month: the two months before it are omitted
+        assert len(result["data"]) == 1
 
         # Each month should have required fields
         for month_data in result["data"]:
