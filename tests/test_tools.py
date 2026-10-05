@@ -895,7 +895,8 @@ class TestR1AccountsResource:
         result = get_accounts_resource(populated_db)
 
         assert "accounts" in result
-        assert "total_in_user_currency" in result
+        assert "in_balance_total" in result
+        assert "off_balance_total" in result
         assert "user_currency" in result
 
     def test_accounts_resource_excludes_archived(self, populated_db: Database):
@@ -2105,7 +2106,7 @@ class TestOutOfBalanceInNetWorth:
         assert "accounts" in result["out_of_balance"]
 
     def test_out_of_balance_included_in_net_worth(self, populated_db: Database):
-        """ISSUE-001: out_of_balance total should be included in net_worth."""
+        """ISSUE-001: off-balance accounts count towards net_worth once, inside their type group."""
         result = get_net_worth(populated_db)
         breakdown = result["breakdown"]
         expected = (
@@ -2113,9 +2114,11 @@ class TestOutOfBalanceInNetWorth:
             + breakdown["savings"]["total"]
             + breakdown["loans"]["total"]
             + breakdown["debts"]["total"]
-            + result["out_of_balance"]["total"]
         )
         assert result["net_worth"] == pytest.approx(expected, abs=0.01)
+
+        grouped_ids = {acc["id"] for group in breakdown.values() for acc in group["accounts"]}
+        assert {acc["id"] for acc in result["out_of_balance"]["accounts"]} <= grouped_ids
 
 
 # ============================================================================

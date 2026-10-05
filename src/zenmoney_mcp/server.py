@@ -172,7 +172,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_net_worth",
-            description="Get total net worth: sum of all accounts broken down by type (current, savings, loans, debts).",
+            description="Get total net worth: sum of all accounts broken down by type (current, savings, loans, debts). Off-balance accounts are included and flagged; in_balance_total is the balance the ZenMoney app shows.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -180,13 +180,14 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_liquidity",
-            description="Get liquid funds: how much cash is available. Answers: 'Can I afford this purchase?', 'How much cash do I have?'",
+            description="Get liquid funds: how much cash is available, with savings (in and off balance) listed separately. Answers: 'Can I afford this purchase?', 'How much cash do I have?'",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "target_amount": {
                         "type": "number",
-                        "description": "Target purchase amount to check affordability",
+                        "minimum": 0,
+                        "description": "Target purchase amount to check affordability, in the user's main currency (convert other currencies first)",
                     },
                 },
             },
@@ -445,7 +446,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_debts",
-            description="Get debt summary: who owes whom. Answers: 'My debts?', 'Who owes me?'",
+            description="Get debt summary: who owes whom, per person, in the user's main currency, with loans and repayments labelled. Answers: 'My debts?', 'Who owes me?'",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -467,7 +468,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="convert_currency",
-            description="Convert amount between currencies using real ZenMoney exchange rates. Answers: 'How much is 100 USD in EUR?'",
+            description="Convert amount between currencies using real ZenMoney exchange rates. Answers: 'How much is 100 USD in EUR?'. Crypto is kept in micro-units (code BTC is μBTC, one millionth of a bitcoin): check symbol and title in the result.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -489,14 +490,14 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_exchange_rates",
-            description="Get current exchange rates with cross-rate table. Defaults to currencies from your accounts. Use for any currency rate questions.",
+            description="Get current exchange rates with cross-rate table and the rate to the user's main currency. Defaults to currencies from your accounts. Use for any currency rate questions.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "currencies": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of currency codes (e.g. ['USD', 'EUR', 'PLN']). If omitted, uses currencies from your accounts.",
+                        "description": "List of currency codes (e.g. ['USD', 'EUR', 'PLN']). If omitted, uses currencies from your accounts. Codes ZenMoney does not know come back in unknown_currencies.",
                     },
                 },
             },
@@ -728,7 +729,7 @@ async def list_resources() -> list[Resource]:
         Resource(
             uri="zenmoney://accounts",
             name="Accounts",
-            description="Active accounts with balances",
+            description="Active accounts with balances, in-balance and off-balance totals",
             mimeType="application/json",
         ),
         Resource(

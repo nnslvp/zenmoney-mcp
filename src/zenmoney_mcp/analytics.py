@@ -102,8 +102,14 @@ def get_net_worth(db: Database) -> dict[str, Any]:
 
     T1: "How much money do I have?"
 
+    Every non-archived account is counted once, in the group of its type, whether
+    or not it is in balance: the system debt account is always off-balance, and
+    savings are often kept off-balance too.
+
     Returns:
-        Dictionary with net_worth breakdown by account type.
+        Dictionary with net_worth, its breakdown by account type, in_balance_total
+        (the balance the ZenMoney app shows) and off_balance_total. out_of_balance
+        lists the off-balance accounts again; it is already part of the breakdown.
     """
     conn = db.connect()
 
@@ -120,7 +126,7 @@ def get_net_worth(db: Database) -> dict[str, Any]:
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     currency_symbol = currency_row["symbol"] if currency_row else "₽"
 
-    # Get all active accounts in balance
+    # Get all active accounts, in balance or not
     rows = conn.execute("""
         SELECT a.id, a.title, a.type, a.balance, a.credit_limit,
                a.in_balance, a.savings, a.instrument,
@@ -136,12 +142,13 @@ def get_net_worth(db: Database) -> dict[str, Any]:
     savings_accounts = []  # deposit, savings=1
     loans_accounts = []    # loan
     debts_accounts = []    # debt
-    out_of_balance = []    # in_balance = 0
+    out_of_balance = []    # in_balance = 0, also listed in their type group
 
     current_total = 0.0
     savings_total = 0.0
     loans_total = 0.0
     debts_total = 0.0
+    in_balance_total = 0.0
     out_of_balance_total = 0.0
 
     for row in rows:
@@ -161,12 +168,14 @@ def get_net_worth(db: Database) -> dict[str, Any]:
             "currency": row["currency"] or "???",
             "currency_symbol": row["currency_symbol"] or "?",
             "converted": round(converted, 2),
+            "in_balance": bool(row["in_balance"]),
         }
 
-        if not row["in_balance"]:
+        if row["in_balance"]:
+            in_balance_total += converted
+        else:
             out_of_balance.append(account_info)
             out_of_balance_total += converted
-            continue
 
         acc_type = row["type"]
         is_savings = row["savings"]
@@ -184,10 +193,12 @@ def get_net_worth(db: Database) -> dict[str, Any]:
             current_accounts.append(account_info)
             current_total += converted
 
-    net_worth = current_total + savings_total + loans_total + debts_total + out_of_balance_total
+    net_worth = current_total + savings_total + loans_total + debts_total
 
     return {
         "net_worth": round(net_worth, 2),
+        "in_balance_total": round(in_balance_total, 2),
+        "off_balance_total": round(out_of_balance_total, 2),
         "currency": currency_code,
         "currency_symbol": currency_symbol,
         "breakdown": {
@@ -223,13 +234,32 @@ def get_liquidity(
 
     T2: "How much liquid cash?", "Can I afford a purchase?"
 
+    Liquid funds are in-balance cash, cards and checking accounts. Savings
+    (deposits and accounts flagged as savings, in or off balance) are reported
+    separately and are only the second source in the affordability check.
+
+    liquid_own is a net figure: negative balances (overdrafts, used credit) are
+    subtracted for every account type and summed up in negative_balances_total.
+
     Args:
         db: Database instance.
-        target_amount: Optional target purchase amount to check affordability.
+        target_amount: Optional target purchase amount to check affordability,
+            in the user's main currency.
 
     Returns:
         Dictionary with liquid funds breakdown and affordability check.
+
+    Raises:
+        ValueError: If target_amount is negative or not a finite number.
     """
+    if target_amount is not None:
+        is_number = isinstance(target_amount, (int, float)) and not isinstance(target_amount, bool)
+        if not is_number or not 0 <= target_amount < float("inf"):
+            raise ValueError(
+                f"Invalid target_amount {target_amount!r}: expected a non-negative number "
+                "in the user's main currency"
+            )
+
     conn = db.connect()
 
     # Get user currency
@@ -244,20 +274,22 @@ def get_liquidity(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     currency_symbol = currency_row["symbol"] if currency_row else "₽"
 
-    # Get all non-archived accounts
+    # Get all non-archived accounts that hold own money. Debt and loan accounts
+    # are money owed by or to someone, never funds to spend.
     rows = conn.execute("""
         SELECT a.id, a.title, a.type, a.balance, a.credit_limit,
                a.in_balance, a.savings, a.instrument,
                i.short_title as currency, i.rate
         FROM accounts a
         LEFT JOIN instruments i ON i.id = a.instrument
-        WHERE a.archive = 0 AND a.in_balance = 1
+        WHERE a.archive = 0 AND a.type NOT IN ('debt', 'loan')
         ORDER BY a.type, a.balance DESC
     """).fetchall()
 
-    liquid_own = 0.0  # Own money in liquid accounts
+    liquid_own = 0.0  # Own money in liquid accounts, net of negative balances
     liquid_with_credit = 0.0  # Including available credit
     savings_accessible = 0.0  # Savings (less liquid)
+    negative_balances = 0.0  # Owed on overdrawn liquid accounts, part of liquid_own
 
     liquid_accounts = []
     credit_accounts = []
@@ -288,17 +320,27 @@ def get_liquidity(
         }
 
         # Categorize accounts
-        if acc_type in ("cash", "ccard", "checking", "emoney"):
-            # Liquid accounts
+        if acc_type == "deposit" or is_savings:
+            # Savings: accessible but less liquid. Counted in or off balance,
+            # savings are often kept off-balance.
+            account_info["in_balance"] = bool(row["in_balance"])
+            savings_accessible += converted_balance
+            savings_accounts.append(account_info)
+
+        elif row["in_balance"] and acc_type in ("cash", "ccard", "checking", "emoney"):
+            # Liquid accounts. A negative balance is money already owed, so it
+            # reduces own funds on a card just as on any other account; this is
+            # also the net figure the ZenMoney app shows as the balance.
+            liquid_own += converted_balance
+            if converted_balance < 0:
+                negative_balances += converted_balance
+
             if acc_type == "ccard":
-                # Credit card: own funds (if positive) + available credit
-                own_funds = max(0, converted_balance)
+                # Credit card: balance + available credit
                 available_credit = converted_balance + converted_credit if converted_credit > 0 else converted_balance
 
-                liquid_own += own_funds
                 liquid_with_credit += available_credit
 
-                account_info["own_funds"] = round(own_funds, 2)
                 account_info["available_credit"] = round(available_credit, 2)
                 account_info["credit_limit"] = round(converted_credit, 2)
 
@@ -308,20 +350,15 @@ def get_liquidity(
                     liquid_accounts.append(account_info)
             else:
                 # Cash, checking, emoney: all balance is liquid
-                liquid_own += converted_balance
                 liquid_with_credit += converted_balance
                 liquid_accounts.append(account_info)
-
-        elif acc_type == "deposit" or is_savings:
-            # Savings: accessible but less liquid
-            savings_accessible += converted_balance
-            savings_accounts.append(account_info)
 
     total_available = liquid_own + savings_accessible
 
     result = {
         "liquid_own": round(liquid_own, 2),
         "liquid_with_credit": round(liquid_with_credit, 2),
+        "negative_balances_total": round(negative_balances, 2),
         "savings_accessible": round(savings_accessible, 2),
         "total_available": round(total_available, 2),
         "currency": currency_code,
@@ -333,27 +370,42 @@ def get_liquidity(
         },
     }
 
-    # Target affordability check
+    # Target affordability check: own money first (liquid, then savings).
+    # Credit is borrowed money, so it is only mentioned as an alternative.
     if target_amount is not None:
+        needed_from_savings = 0.0
+        shortfall = 0.0
+
+        if liquid_own >= target_amount:
+            verdict = "affordable_from_liquid"
+            recommendation = "Affordable from liquid funds"
+        elif total_available >= target_amount:
+            verdict = "affordable_with_savings"
+            needed_from_savings = target_amount - liquid_own
+            recommendation = (
+                f"Affordable only by using savings: "
+                f"{round(needed_from_savings, 2)} {currency_code} must come from savings"
+            )
+        else:
+            verdict = "insufficient"
+            shortfall = target_amount - total_available
+            recommendation = (
+                f"Insufficient funds even with savings (short {round(shortfall, 2)} {currency_code})"
+            )
+
+        if verdict != "affordable_from_liquid" and liquid_with_credit >= target_amount:
+            recommendation += ". Alternatively, available credit covers it"
+
         result["target_check"] = {
             "target": target_amount,
+            "verdict": verdict,
+            "needed_from_savings": round(needed_from_savings, 2),
+            "shortfall": round(shortfall, 2),
             "affordable_from_liquid": liquid_own >= target_amount,
             "affordable_with_credit": liquid_with_credit >= target_amount,
             "affordable_with_savings": total_available >= target_amount,
+            "recommendation": recommendation,
         }
-
-        # Add recommendation
-        if liquid_own >= target_amount:
-            result["target_check"]["recommendation"] = "Affordable from own liquid funds"
-        elif liquid_with_credit >= target_amount:
-            shortfall = target_amount - liquid_own
-            result["target_check"]["recommendation"] = f"Need credit ({round(shortfall, 2)} {currency_code} shortfall)"
-        elif total_available >= target_amount:
-            shortfall = target_amount - liquid_with_credit
-            result["target_check"]["recommendation"] = f"Need to use savings ({round(shortfall, 2)} {currency_code} shortfall)"
-        else:
-            shortfall = target_amount - total_available
-            result["target_check"]["recommendation"] = f"Insufficient funds (short {round(shortfall, 2)} {currency_code})"
 
     return result
 
@@ -1972,10 +2024,24 @@ def get_debts(db: Database) -> dict[str, Any]:
 
     T11: "Who owes me?", "Who do I owe?", "Debt summary"
 
+    All amounts are in the user's currency. Each operation is labelled from the
+    user's point of view: money given is "you_lent", or "you_repaid" if it reduces
+    what the user owed; money received is "you_borrowed", or "they_repaid" if it
+    reduces what the person owed.
+
     Returns:
         Dictionary with debts breakdown by counterparty.
     """
     conn = db.connect()
+
+    # Get user currency
+    user_currency_id = db.get_user_currency()
+    currency_row = conn.execute(
+        "SELECT short_title, rate FROM instruments WHERE id = ?",
+        (user_currency_id,)
+    ).fetchone()
+    currency_code = currency_row["short_title"] if currency_row else "RUB"
+    user_rate = currency_row["rate"] if currency_row else None
 
     # Find debt accounts
     debt_accounts = conn.execute(
@@ -1984,7 +2050,7 @@ def get_debts(db: Database) -> dict[str, Any]:
 
     if not debt_accounts:
         return {
-            "currency": "RUB",
+            "currency": currency_code,
             "summary": {
                 "total_owed_to_you": 0.0,
                 "total_you_owe": 0.0,
@@ -1993,31 +2059,28 @@ def get_debts(db: Database) -> dict[str, Any]:
             "by_counterparty": [],
         }
 
-    # Get user currency
-    user_currency_id = db.get_user_currency()
-    currency_row = conn.execute(
-        "SELECT short_title FROM instruments WHERE id = ?",
-        (user_currency_id,)
-    ).fetchone()
-    currency_code = currency_row["short_title"] if currency_row else "RUB"
-
     counterparties_data = {}
 
     for debt_acc in debt_accounts:
         account_id = debt_acc["id"]
-        account_balance = debt_acc["balance"] or 0
 
-        # Get all transactions for this debt account
+        # Get all transactions for this debt account, oldest first: the label of
+        # an operation depends on the balance before it. A debt operation is
+        # recorded in the currency of the non-debt account, on both sides.
         rows = conn.execute("""
             SELECT t.id, t.date, t.income, t.outcome,
                    t.income_account, t.outcome_account,
                    t.merchant, t.payee, t.comment,
-                   m.title as merchant_title
+                   m.title as merchant_title,
+                   ii.short_title as income_currency, ii.rate as income_rate,
+                   oi.short_title as outcome_currency, oi.rate as outcome_rate
             FROM transactions t
             LEFT JOIN merchants m ON m.id = t.merchant
+            LEFT JOIN instruments ii ON ii.id = t.income_instrument
+            LEFT JOIN instruments oi ON oi.id = t.outcome_instrument
             WHERE t.deleted = 0
               AND (t.income_account = ? OR t.outcome_account = ?)
-            ORDER BY t.date DESC
+            ORDER BY t.date, t.created
         """, (account_id, account_id)).fetchall()
 
         for row in rows:
@@ -2033,30 +2096,58 @@ def get_debts(db: Database) -> dict[str, Any]:
                     "balance": 0.0,
                     "history": [],
                 }
+            elif row["merchant"]:
+                counterparties_data[counterparty]["merchant_id"] = row["merchant"]
 
-            # Determine transaction type and update balance
-            if row["income_account"] == account_id:
-                # Money came into debt account (I lent money or they returned)
-                amount = row["income"]
-                tx_type = "lent" if row["outcome"] > 0 else "received"
-                counterparties_data[counterparty]["balance"] += amount
+            # Both sides of a debt operation are > 0; the direction is given by
+            # which side is the debt account.
+            given = row["income_account"] == account_id
+            if given:
+                # Money came into debt account (I lent money or I returned)
+                original_amount = row["income"]
+                original_currency = row["income_currency"]
+                rate = row["income_rate"]
             else:
-                # Money went out from debt account (They lent me or I returned)
-                amount = row["outcome"]
-                tx_type = "borrowed" if row["income"] > 0 else "returned"
-                counterparties_data[counterparty]["balance"] -= amount
+                # Money went out from debt account (They lent me or they returned)
+                original_amount = row["outcome"]
+                original_currency = row["outcome_currency"]
+                rate = row["outcome_rate"]
 
-            counterparties_data[counterparty]["history"].append({
+            # Convert to user currency. An operation without a known instrument is
+            # taken as is: the debt account itself is always in the user's currency.
+            is_foreign = bool(
+                original_currency and original_currency != currency_code and rate and user_rate
+            )
+            amount = original_amount * rate / user_rate if is_foreign else original_amount
+
+            # Update balance (positive: they owe me). An operation that reduces
+            # what is outstanding is a repayment, any other one is a new loan.
+            balance_before = counterparties_data[counterparty]["balance"]
+            balance_after = balance_before + amount if given else balance_before - amount
+            counterparties_data[counterparty]["balance"] = balance_after
+
+            is_repayment = abs(balance_after) < abs(balance_before)
+            if given:
+                tx_type = "you_repaid" if is_repayment else "you_lent"
+            else:
+                tx_type = "they_repaid" if is_repayment else "you_borrowed"
+
+            history_entry = {
                 "date": row["date"],
                 "amount": round(amount, 2),
                 "type": tx_type,
                 "comment": row["comment"],
-            })
+            }
+            if is_foreign:
+                history_entry["original_amount"] = round(original_amount, 2)
+                history_entry["original_currency"] = original_currency
+            counterparties_data[counterparty]["history"].append(history_entry)
 
     # Format counterparties
     by_counterparty = []
     for cp_data in counterparties_data.values():
-        net_balance = cp_data["balance"]
+        # Rounded first: converted amounts leave float dust on a repaid debt
+        net_balance = round(cp_data["balance"], 2)
 
         if net_balance > 0:
             status = "they_owe_you"
@@ -2065,19 +2156,20 @@ def get_debts(db: Database) -> dict[str, Any]:
         else:
             status = "settled"
 
-        # Get last activity
-        if cp_data["history"]:
-            last_activity = cp_data["history"][0]["date"]
+        # Get last activity (history is oldest first)
+        history = cp_data["history"][::-1]
+        if history:
+            last_activity = history[0]["date"]
         else:
             last_activity = None
 
         by_counterparty.append({
             "counterparty": cp_data["name"],
             "merchant_id": cp_data["merchant_id"],
-            "net_amount": round(net_balance, 2),
+            "net_amount": net_balance,
             "status": status,
             "last_activity": last_activity,
-            "transactions": cp_data["history"][:10],  # Last 10 transactions
+            "transactions": history[:10],  # Last 10 transactions
         })
 
     # Sort by absolute balance descending
@@ -3058,18 +3150,21 @@ def get_accounts_resource(db: Database) -> dict[str, Any]:
         ORDER BY a.in_balance DESC, a.balance DESC
     """).fetchall()
 
-    total_converted = 0.0
+    in_balance_total = 0.0  # what the ZenMoney app shows as the balance
+    off_balance_total = 0.0
     accounts = []
     for row in rows:
         balance = row["balance"] or 0
-        if row["in_balance"]:
-            instrument_row = conn.execute(
-                "SELECT id FROM instruments WHERE short_title = ?",
-                (row["currency"],)
-            ).fetchone()
-            if instrument_row:
-                converted = convert_to_user_currency(balance, instrument_row["id"], db, user_currency_id)
-                total_converted += converted
+        instrument_row = conn.execute(
+            "SELECT id FROM instruments WHERE short_title = ?",
+            (row["currency"],)
+        ).fetchone()
+        if instrument_row:
+            converted = convert_to_user_currency(balance, instrument_row["id"], db, user_currency_id)
+            if row["in_balance"]:
+                in_balance_total += converted
+            else:
+                off_balance_total += converted
 
         accounts.append({
             "id": row["id"],
@@ -3085,7 +3180,8 @@ def get_accounts_resource(db: Database) -> dict[str, Any]:
 
     return {
         "accounts": accounts,
-        "total_in_user_currency": round(total_converted, 2),
+        "in_balance_total": round(in_balance_total, 2),
+        "off_balance_total": round(off_balance_total, 2),
         "user_currency": user_currency,
     }
 
@@ -3234,6 +3330,31 @@ def get_instruments_resource(db: Database) -> dict[str, Any]:
     }
 
 
+_MAX_CONVERT_AMOUNT = 1e15
+
+
+def _round_keep_small(value: float, decimals: int) -> float:
+    """Round to `decimals` places; a value below 1 keeps `decimals` significant digits instead.
+
+    Fixed decimals flatten the rate of a weak currency: 1 IRR is about 0.0000006 USD,
+    which rounds to 0.000001 or, in a description, to 0.0.
+    """
+    if abs(value) >= 1:
+        return round(value, decimals)
+    return float(f"{value:.{decimals}g}")
+
+
+def _unit_label(code: str, symbol: str | None) -> str:
+    """Unit to name in a rate: the code, or the symbol when it is a scaled form of the code.
+
+    ZenMoney keeps crypto in micro-units: the instrument with code BTC has the
+    symbol μBTC, and "1 BTC = 0.09 USD" would be off by a factor of a million.
+    """
+    if symbol and symbol != code and symbol.endswith(code):
+        return symbol
+    return code
+
+
 def convert_currency(
     db: Database,
     amount: float,
@@ -3246,6 +3367,9 @@ def convert_currency(
     All rates are stored relative to RUB, so cross-rates are calculated as:
     amount_to = amount * from_rate / to_rate
 
+    Amounts are in the instrument's own unit and are never rescaled; title and
+    symbol are returned so the unit is visible (crypto is kept in micro-units).
+
     Args:
         db: Database instance.
         amount: Amount to convert.
@@ -3254,17 +3378,33 @@ def convert_currency(
 
     Returns:
         Conversion result with rate and converted amount.
+
+    Raises:
+        ValueError: If the amount is not a finite number of a sane size, or a
+            currency code is blank.
     """
+    # NaN and infinity fail the comparison too; a huge amount would overflow into
+    # Infinity, which is not valid JSON.
+    is_number = isinstance(amount, (int, float)) and not isinstance(amount, bool)
+    if not is_number or not abs(amount) <= _MAX_CONVERT_AMOUNT:
+        raise ValueError(
+            f"Invalid amount {amount!r}: expected a finite number, "
+            f"at most {_MAX_CONVERT_AMOUNT:g} in absolute value"
+        )
+    for field, code in (("from_currency", from_currency), ("to_currency", to_currency)):
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError(f"Invalid {field} {code!r}: expected a currency code like 'USD'")
+
     conn = db.connect()
 
     from_row = conn.execute(
         "SELECT id, title, short_title, symbol, rate FROM instruments WHERE short_title = ?",
-        (from_currency.upper(),),
+        (from_currency.strip().upper(),),
     ).fetchone()
 
     to_row = conn.execute(
         "SELECT id, title, short_title, symbol, rate FROM instruments WHERE short_title = ?",
-        (to_currency.upper(),),
+        (to_currency.strip().upper(),),
     ).fetchone()
 
     if not from_row:
@@ -3279,7 +3419,7 @@ def convert_currency(
         return {"error": f"Rate for {to_currency} is 0, conversion not possible"}
 
     cross_rate = from_rate / to_rate
-    converted = round(amount * cross_rate, 2)
+    converted = _round_keep_small(amount * cross_rate, 2)
 
     # Also get user currency for context
     user_currency_id = db.get_user_currency()
@@ -3294,22 +3434,27 @@ def convert_currency(
         "from": {
             "amount": amount,
             "currency": from_row["short_title"],
+            "title": from_row["title"],
             "symbol": from_row["symbol"],
         },
         "to": {
             "amount": converted,
             "currency": to_row["short_title"],
+            "title": to_row["title"],
             "symbol": to_row["symbol"],
         },
-        "rate": round(cross_rate, 6),
-        "inverse_rate": round(1 / cross_rate, 6) if cross_rate != 0 else None,
-        "rate_description": f"1 {from_row['short_title']} = {round(cross_rate, 4)} {to_row['short_title']}",
+        "rate": _round_keep_small(cross_rate, 6),
+        "inverse_rate": _round_keep_small(1 / cross_rate, 6) if cross_rate != 0 else None,
+        "rate_description": (
+            f"1 {_unit_label(from_row['short_title'], from_row['symbol'])} = "
+            f"{_round_keep_small(cross_rate, 4)} {_unit_label(to_row['short_title'], to_row['symbol'])}"
+        ),
     }
 
     if user_row and user_row["short_title"] not in (from_row["short_title"], to_row["short_title"]):
         user_rate = from_rate / user_row["rate"] if user_row["rate"] != 0 else 0
         result["in_user_currency"] = {
-            "amount": round(amount * user_rate, 2),
+            "amount": _round_keep_small(amount * user_rate, 2),
             "currency": user_row["short_title"],
             "symbol": user_row["symbol"],
         }
@@ -3328,12 +3473,24 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
         currencies: Optional list of currency codes to include.
 
     Returns:
-        Exchange rate table with cross-rates.
+        Exchange rate table with cross-rates. Requested codes that ZenMoney does
+        not know are listed in unknown_currencies.
+
+    Raises:
+        ValueError: If currencies is not a list of currency codes.
     """
     conn = db.connect()
 
     if currencies:
-        codes = [c.upper() for c in currencies]
+        is_code_list = isinstance(currencies, (list, tuple)) and all(
+            isinstance(c, str) and c.strip() for c in currencies
+        )
+        if not is_code_list:
+            raise ValueError(
+                f"Invalid currencies {currencies!r}: expected a list of currency codes like ['USD', 'EUR']"
+            )
+        # Normalize and de-duplicate, keeping the requested order
+        codes = list(dict.fromkeys(c.strip().upper() for c in currencies))
     else:
         # Get currencies from user's active accounts
         rows = conn.execute("""
@@ -3356,17 +3513,20 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
     ).fetchall()
 
     instr_map = {r["short_title"]: r for r in instruments}
+    unknown_codes = [code for code in codes if code not in instr_map]
 
     # Get user currency
     user_currency_id = db.get_user_currency()
     user_code = None
+    user_rate = None
     if user_currency_id:
         user_row = conn.execute(
-            "SELECT short_title FROM instruments WHERE id = ?",
+            "SELECT short_title, rate FROM instruments WHERE id = ?",
             (int(user_currency_id),),
         ).fetchone()
         if user_row:
             user_code = user_row["short_title"]
+            user_rate = user_row["rate"]
 
     # Build cross-rate table
     cross_rates = {}
@@ -3380,7 +3540,7 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
                 continue
             rate_to = instr_map[other_code]["rate"]
             if rate_to != 0:
-                rates[other_code] = round(rate_from / rate_to, 6)
+                rates[other_code] = _round_keep_small(rate_from / rate_to, 6)
         cross_rates[code] = rates
 
     # Build summary list
@@ -3395,14 +3555,16 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
             "title": r["title"],
             "rate_to_rub": r["rate"],
         }
-        if user_code and user_code in cross_rates.get(code, {}):
-            entry[f"rate_to_{user_code}"] = cross_rates[code][user_code]
+        # Always given, whether or not the user's currency was requested
+        if user_rate and code != user_code:
+            entry[f"rate_to_{user_code}"] = _round_keep_small(r["rate"] / user_rate, 6)
         rate_list.append(entry)
 
     return {
         "user_currency": user_code,
         "currencies": rate_list,
         "cross_rates": cross_rates,
+        "unknown_currencies": unknown_codes,
         "rate_source": "cbr",
         "note": "Rates from ZenMoney (Central Bank of Russia, updated on sync). rate_to_rub = cost of 1 unit in RUB.",
     }
