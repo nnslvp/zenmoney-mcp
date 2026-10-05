@@ -1173,6 +1173,235 @@ def _current_budget_month(month_start_day: int, today: date) -> tuple[int, int]:
     return today.year, today.month - 1
 
 
+_BUDGET_TOTAL_TAG = "00000000-0000-0000-0000-000000000000"
+_UNBUDGETED_TOP_N = 5
+
+
+def _budget_currency(db: Database) -> tuple[int, str, float]:
+    """User's currency for budget figures: (instrument id, code, rate)."""
+    user_currency_id = db.get_user_currency()
+    if not user_currency_id:
+        user_currency_id = 2  # Default to RUB
+
+    currency_row = db.connect().execute(
+        "SELECT short_title, rate FROM instruments WHERE id = ?",
+        (user_currency_id,)
+    ).fetchone()
+    currency_code = currency_row["short_title"] if currency_row else "RUB"
+    user_rate = currency_row["rate"] if currency_row else 1.0
+    return user_currency_id, currency_code, user_rate
+
+
+def _load_budget_plan(
+    db: Database,
+    budget_date: str,
+    period_start: date,
+    period_end: date,
+    user_rate: float,
+) -> dict[str, Any]:
+    """Planned expenses of one budget month, grouped by top-level category.
+
+    Shared by check_budget_health and the budgets/current resource, so both
+    report the same numbers.
+
+    How a plan is built (ZenMoney API, Budget):
+      - a locked row is the exact budget of its category;
+      - an unlocked row is its stored amount plus the scheduled expenses
+        (reminder markers) of the category in the period. No row at all is the
+        same as an unlocked 0, so scheduled expenses alone make a plan too;
+      - an unlocked parent stores what is left over its children, so the plan
+        of a top-level category is its own amount plus the plans of its children;
+      - the month-total row works the same way one level up: locked it is the
+        exact plan of the month, unlocked it is added to the category plans.
+
+    Args:
+        db: Database instance.
+        budget_date: First day of the budget month ('YYYY-MM-01'), the key of budget rows.
+        period_start: First day of the budget period.
+        period_end: Last day of the budget period.
+        user_rate: Rate of the user's currency, scheduled amounts are converted to it.
+
+    Returns:
+        {"entries": [...], "overall": {"planned", "source", "breakdown"?}}. An entry
+        is one top-level category: tag_id, name, planned, locked, breakdown (None
+        for a plain stored amount) and its subcategories (children that have a
+        plan of their own). "overall" is the plan of the whole month.
+    """
+    conn = db.connect()
+    rate = user_rate or 1.0
+
+    budget_rows = conn.execute("""
+        SELECT b.tag, b.outcome, b.outcome_lock,
+               t.title AS title, t.parent AS parent_id, p.title AS parent_title
+        FROM budgets b
+        LEFT JOIN tags t ON t.id = b.tag
+        LEFT JOIN tags p ON p.id = t.parent
+        WHERE b.date = ?
+    """, (budget_date,)).fetchall()
+
+    # Scheduled expenses by category; a marker is in the currency of its account.
+    # Same in-balance rule as for actuals, so plan and actual cover the same accounts.
+    scheduled_rows = conn.execute("""
+        SELECT json_extract(rm.tag, '$[0]') AS tag,
+               t.title AS title, t.parent AS parent_id, p.title AS parent_title,
+               SUM(rm.outcome * COALESCE(i.rate, ?) / ?) AS total
+        FROM reminder_markers rm
+        LEFT JOIN accounts a ON a.id = rm.outcome_account
+        LEFT JOIN instruments i ON i.id = a.instrument
+        LEFT JOIN tags t ON t.id = json_extract(rm.tag, '$[0]')
+        LEFT JOIN tags p ON p.id = t.parent
+        WHERE rm.state IN ('planned', 'processed')
+          AND rm.outcome > 0 AND COALESCE(rm.income, 0) = 0
+          AND rm.date >= ? AND rm.date <= ?
+          AND (a.in_balance = 1 OR a.in_balance IS NULL)
+        GROUP BY json_extract(rm.tag, '$[0]')
+    """, (rate, rate, period_start.isoformat(), period_end.isoformat())).fetchall()
+
+    # One node per category that has a budget row or scheduled expenses
+    total = None
+    nodes: dict[str | None, dict[str, Any]] = {}
+
+    def node_for(row: Any) -> dict[str, Any]:
+        return nodes.setdefault(row["tag"], {
+            "tag_id": row["tag"],
+            "name": row["title"],
+            "parent_id": row["parent_id"],
+            "parent_name": row["parent_title"],
+            "budget": 0.0,
+            "locked": False,
+            "scheduled": 0.0,
+        })
+
+    for row in budget_rows:
+        if row["tag"] == _BUDGET_TOTAL_TAG:
+            total = {"budget": row["outcome"] or 0.0, "locked": bool(row["outcome_lock"])}
+            continue
+        node_for(row).update(budget=row["outcome"] or 0.0, locked=bool(row["outcome_lock"]))
+
+    for row in scheduled_rows:
+        node = node_for(row)
+        if not node["locked"]:
+            node["scheduled"] = row["total"]
+
+    # Group the nodes by top-level category; a child without a parent row still
+    # gets a parent entry (whose own budget is 0)
+    entries: dict[str | None, dict[str, Any]] = {}
+    for node in nodes.values():
+        is_child = bool(node["parent_id"])
+        root_id = node["parent_id"] if is_child else node["tag_id"]
+        root_name = node["parent_name"] if is_child else node["name"]
+        if root_id is None:
+            root_name = "Uncategorized"
+        entry = entries.setdefault(root_id, {
+            "tag_id": root_id,
+            "name": root_name or "Unknown category",
+            "budget": 0.0,
+            "locked": False,
+            "scheduled": 0.0,
+            "subcategories": [],
+        })
+        if is_child:
+            entry["subcategories"].append({
+                "tag_id": node["tag_id"],
+                "name": node["name"] or "Unknown category",
+                "planned": node["budget"] + node["scheduled"],
+                "locked": node["locked"],
+                "breakdown": {
+                    "budget": round(node["budget"], 2),
+                    "scheduled": round(node["scheduled"], 2),
+                } if node["scheduled"] else None,
+            })
+        else:
+            entry.update(budget=node["budget"], locked=node["locked"], scheduled=node["scheduled"])
+
+    # An unlocked parent stores what is left over its children; a locked one is exact
+    for entry in entries.values():
+        children_planned = 0.0
+        if not entry["locked"]:
+            children_planned = sum((child["planned"] for child in entry["subcategories"]), 0.0)
+        entry["planned"] = entry["budget"] + entry["scheduled"] + children_planned
+        # How the plan was built, when it is more than the stored amount
+        entry["breakdown"] = {
+            "budget": round(entry["budget"], 2),
+            "scheduled": round(entry["scheduled"], 2),
+            "subcategories": round(children_planned, 2),
+        } if entry["scheduled"] or children_planned else None
+
+    # The month total follows the same rule one level up. An unlocked total of 0
+    # is how the API spells "no budget", the same as no total row.
+    categories_planned = sum(max(entry["planned"], 0) for entry in entries.values())
+    if total is None or (not total["locked"] and total["budget"] == 0):
+        overall = {"planned": categories_planned, "source": "category_budgets"}
+    elif total["locked"] or categories_planned == 0:
+        overall = {"planned": total["budget"], "source": "month_total"}
+    else:
+        overall = {
+            "planned": total["budget"] + categories_planned,
+            "source": "month_total_plus_category_budgets",
+            "breakdown": {
+                "month_total": round(total["budget"], 2),
+                "categories": round(categories_planned, 2),
+            },
+        }
+
+    return {"entries": list(entries.values()), "overall": overall}
+
+
+def _budget_metrics(
+    planned: float,
+    actual: float,
+    days_elapsed: int,
+    days_total: int,
+    days_remaining: int,
+) -> dict[str, Any]:
+    """Plan vs actual figures of one budget line (category, subcategory or month total)."""
+    if planned <= 0:
+        # Nothing is planned here: there is no budget to measure the spending against
+        return {
+            "planned": 0.0,
+            "actual": round(actual, 2),
+            "remaining": None,
+            "pct_used": None,
+            "daily_remaining": None,
+            "status": "no_budget",
+            "pace": None,
+        }
+
+    remaining = planned - actual
+    pct_used = actual / planned * 100
+    daily_remaining = (remaining / days_remaining) if days_remaining > 0 else 0
+
+    # Determine status; spending exactly the plan (a scheduled bill paid in full)
+    # uses the budget up but does not overspend it
+    if round(actual - planned, 2) > 0:
+        status = "overspent"
+    elif pct_used >= 80:
+        status = "warning"
+    else:
+        status = "on_track"
+
+    # Calculate pace
+    month_progress = days_elapsed / days_total if days_total > 0 else 0
+    spend_progress = pct_used / 100
+
+    if spend_progress > month_progress * 1.1:
+        pace = "ahead_of_pace"
+    elif spend_progress < month_progress * 0.9:
+        pace = "behind_pace"
+    else:
+        pace = "on_pace"
+
+    return {
+        "planned": round(planned, 2),
+        "actual": round(actual, 2),
+        "remaining": round(remaining, 2),
+        "pct_used": round(pct_used, 1),
+        "daily_remaining": round(daily_remaining, 2) if days_remaining > 0 else 0,
+        "status": status,
+        "pace": pace,
+    }
+
+
 def check_budget_health(
     db: Database,
     month: str | None = None,
@@ -1183,22 +1412,35 @@ def check_budget_health(
 
     Args:
         db: Database instance.
-        month: Month in "YYYY-MM" format. If None, uses current month.
+        month: Budget month in "YYYY-MM" format. If None, uses current budget month.
 
     Returns:
-        Dictionary with budget health status for each category.
+        Dictionary with budget health status:
+          - categories: one entry per top-level category that has a plan, with
+            planned / actual / remaining / pct_used / status / pace. Children
+            with a plan of their own are nested as "subcategories"; their
+            amounts are already inside the parent's. "planned_breakdown" shows
+            how a plan was built when scheduled operations or subcategories
+            add to the stored amount. Status "no_budget" marks spending against
+            a plan of zero.
+          - overall: the month as a whole. "planned_source" and "actual_scope"
+            say what is compared: with a month-total budget, all spending of
+            the month; without one, the budgeted categories only.
+          - unbudgeted: spending in categories that have no budget at all.
+
+    Raises:
+        ValueError: If month is not a valid "YYYY-MM".
     """
     conn = db.connect()
     today = date.today()
     month_start_day = db.get_user_month_start_day()
 
     # Determine period and budget month
-    if month:
-        try:
-            target_year, target_month = map(int, month.split("-"))
-            date(target_year, target_month, 1)  # validate
-        except (ValueError, AttributeError):
-            target_year, target_month = _current_budget_month(month_start_day, today)
+    if month is not None:
+        match = _YEAR_MONTH.fullmatch(month) if isinstance(month, str) else None
+        target_year, target_month = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+        if target_year < 1 or not 1 <= target_month <= 12:
+            raise ValueError(f"Invalid month {month!r}: expected YYYY-MM (e.g. '2026-03')")
         period_start, period_end = _compute_budget_period(
             month_start_day, target_year, target_month
         )
@@ -1227,26 +1469,12 @@ def check_budget_health(
     days_remaining = max(0, days_total - days_elapsed)
 
     # Get user currency
-    user_currency_id = db.get_user_currency()
-    if not user_currency_id:
-        user_currency_id = 2  # Default to RUB
+    user_currency_id, currency_code, user_rate = _budget_currency(db)
 
-    currency_row = conn.execute(
-        "SELECT short_title, rate FROM instruments WHERE id = ?",
-        (user_currency_id,)
-    ).fetchone()
-    currency_code = currency_row["short_title"] if currency_row else "RUB"
-    user_rate = currency_row["rate"] if currency_row else 1.0
+    # Load the plan for this month
+    plan = _load_budget_plan(db, budget_date, period_start, period_end, user_rate)
 
-    # Load budgets for this month
-    budget_rows = conn.execute("""
-        SELECT b.tag, b.outcome, b.outcome_lock, t.title as tag_title
-        FROM budgets b
-        LEFT JOIN tags t ON t.id = b.tag
-        WHERE b.date = ?
-    """, (budget_date,)).fetchall()
-
-    if not budget_rows:
+    if not plan["entries"] and plan["overall"]["source"] == "category_budgets":
         return {
             "month": f"{target_year:04d}-{target_month:02d}",
             "period_start": period_start.isoformat(),
@@ -1262,39 +1490,52 @@ def check_budget_health(
     month_start = period_start.isoformat()
     month_end = period_end.isoformat()
 
+    # Actual spending of the period, every transaction once: by category and by
+    # top-level category (a parent includes its children)
+    actual_rows = conn.execute("""
+        SELECT json_extract(t.tag, '$[0]') AS tag_id,
+               COALESCE(tg.parent, json_extract(t.tag, '$[0]')) AS root_id,
+               COALESCE(p.title, tg.title) AS root_name,
+               t.outcome_instrument,
+               SUM(t.outcome) AS outcome
+        FROM transactions t
+        LEFT JOIN accounts a ON a.id = t.outcome_account
+        LEFT JOIN tags tg ON tg.id = json_extract(t.tag, '$[0]')
+        LEFT JOIN tags p ON p.id = tg.parent
+        WHERE t.deleted = 0
+          AND (t.hold IS NULL OR t.hold = 0)
+          AND NOT (t.income > 0 AND t.outcome > 0)
+          AND t.outcome > 0
+          AND t.income = 0
+          AND t.date >= ? AND t.date <= ?
+          AND (a.in_balance = 1 OR a.in_balance IS NULL)
+        GROUP BY json_extract(t.tag, '$[0]'), t.outcome_instrument
+    """, (month_start, month_end)).fetchall()
+
+    actual_by_tag: dict[str | None, float] = {}
+    actual_by_root: dict[str | None, float] = {}
+    root_names: dict[str | None, str] = {None: "Uncategorized"}
+    for row in actual_rows:
+        amount = row["outcome"]
+        instrument_id = row["outcome_instrument"]
+        if instrument_id and instrument_id != user_currency_id:
+            source_rate = db.get_instrument_rate(instrument_id)
+            amount = amount * source_rate / user_rate if user_rate else amount
+        actual_by_tag[row["tag_id"]] = actual_by_tag.get(row["tag_id"], 0.0) + amount
+        actual_by_root[row["root_id"]] = actual_by_root.get(row["root_id"], 0.0) + amount
+        root_names.setdefault(row["root_id"], row["root_name"] or "Unknown category")
+
+    # Most critical first, lines without a budget last
+    def sort_key(line: dict[str, Any]) -> tuple[bool, float]:
+        has_budget = line["pct_used"] is not None
+        return has_budget, line["pct_used"] if has_budget else line["actual"]
+
     categories = []
-    overall_planned = 0.0
     overall_actual = 0.0
 
-    for budget_row in budget_rows:
-        tag_id = budget_row["tag"]
-        tag_title = budget_row["tag_title"]
-        budget_outcome = budget_row["outcome"] or 0
-        outcome_lock = budget_row["outcome_lock"]
-
-        # Special handling for total budget and null category
-        if tag_id == "00000000-0000-0000-0000-000000000000":
-            tag_title = "Monthly total"
-            is_total = True
-        elif not tag_title:
-            tag_title = "Uncategorized"
-            is_total = False
-        else:
-            is_total = False
-
-        # Calculate planned amount
-        if outcome_lock:
-            planned = budget_outcome
-        else:
-            # Include planned reminder markers
-            reminder_sum = conn.execute("""
-                SELECT COALESCE(SUM(outcome), 0) as total
-                FROM reminder_markers
-                WHERE state = 'planned'
-                  AND date >= ? AND date <= ?
-                  AND tag = ?
-            """, (month_start, month_end, tag_id)).fetchone()["total"]
-            planned = budget_outcome + reminder_sum
+    for entry in plan["entries"]:
+        planned = entry["planned"]
+        actual = actual_by_root.get(entry["tag_id"], 0.0)
 
         # Clamp negative planned to 0
         planned_warning = None
@@ -1302,111 +1543,69 @@ def check_budget_health(
             planned_warning = f"Computed planned was {round(planned, 2)}, clamped to 0"
             planned = 0
 
-        # Calculate actual spending for this tag
-        # Include children tags
-        tag_ids = [tag_id] if tag_id else []
-        if tag_id and not is_total:
-            children = conn.execute(
-                "SELECT id FROM tags WHERE parent = ?", (tag_id,)
-            ).fetchall()
-            tag_ids.extend(row["id"] for row in children)
-
-        if tag_ids:
-            placeholders = ",".join("?" * len(tag_ids))
-            actual_query = f"""
-                SELECT t.outcome, t.outcome_instrument
-                FROM transactions t
-                LEFT JOIN accounts a ON a.id = t.outcome_account
-                WHERE t.deleted = 0
-                  AND (t.hold IS NULL OR t.hold = 0)
-                  AND NOT (t.income > 0 AND t.outcome > 0)
-                  AND t.outcome > 0
-                  AND t.income = 0
-                  AND t.date >= ? AND t.date <= ?
-                  AND json_extract(t.tag, '$[0]') IN ({placeholders})
-                  AND (a.in_balance = 1 OR a.in_balance IS NULL)
-            """
-            params = [month_start, month_end] + tag_ids
-            actual_rows = conn.execute(actual_query, params).fetchall()
-
-            actual = 0.0
-            for row in actual_rows:
-                amount = row["outcome"]
-                instrument_id = row["outcome_instrument"]
-                if instrument_id and instrument_id != user_currency_id:
-                    source_rate = db.get_instrument_rate(instrument_id)
-                    amount = amount * source_rate / user_rate if user_rate else amount
-                actual += amount
-        else:
-            actual = 0.0
-
-        # Skip if both planned and actual are zero (except for total)
-        if not is_total and planned == 0 and actual == 0:
+        # Skip if both planned and actual are zero
+        if planned == 0 and actual == 0:
             continue
 
-        # Calculate metrics
-        remaining = planned - actual
-        pct_used = (actual / planned * 100) if planned > 0 else 0
-        daily_remaining = (remaining / days_remaining) if days_remaining > 0 else 0
-
-        # Determine status
-        if pct_used < 80:
-            status = "on_track"
-        elif pct_used < 100:
-            status = "warning"
-        else:
-            status = "overspent"
-
-        # Calculate pace
-        month_progress = days_elapsed / days_total if days_total > 0 else 0
-        spend_progress = pct_used / 100 if planned > 0 else 0
-
-        if spend_progress > month_progress * 1.1:
-            pace = "ahead_of_pace"
-        elif spend_progress < month_progress * 0.9:
-            pace = "behind_pace"
-        else:
-            pace = "on_pace"
+        metrics = _budget_metrics(planned, actual, days_elapsed, days_total, days_remaining)
+        cat_data = {"tag_id": entry["tag_id"], "name": entry["name"], "planned": metrics["planned"]}
+        if entry["breakdown"]:
+            cat_data["planned_breakdown"] = entry["breakdown"]
+        cat_data.update(metrics)
 
         # Generate insight
         insight = None
-        if status == "overspent":
+        if metrics["status"] == "overspent":
             overspend = actual - planned
             insight = f"Overspent by {round(overspend, 2)} {currency_code}"
-        elif status == "warning" and pace == "ahead_of_pace" and days_remaining > 0:
+        elif (
+            metrics["status"] == "warning" and metrics["pace"] == "ahead_of_pace"
+            and days_remaining > 0
+            and days_elapsed > 0  # a future month has no pace yet
+            and metrics["remaining"] > 0  # nothing left to exhaust when the plan is used up
+        ):
+            remaining = planned - actual
             days_until_depleted = int(remaining / (actual / days_elapsed)) if actual > 0 else days_remaining
             if days_until_depleted < days_remaining:
                 insight = f"At current pace, budget will be exhausted in {days_until_depleted} days"
-
-        cat_data = {
-            "tag_id": tag_id,
-            "name": tag_title,
-            "planned": round(planned, 2),
-            "actual": round(actual, 2),
-            "remaining": round(remaining, 2),
-            "pct_used": round(pct_used, 1),
-            "daily_remaining": round(daily_remaining, 2) if days_remaining > 0 else 0,
-            "status": status,
-            "pace": pace,
-        }
 
         if insight:
             cat_data["insight"] = insight
         if planned_warning:
             cat_data["warning"] = planned_warning
 
-        if is_total:
-            overall_data = cat_data.copy()
-            overall_data.pop("tag_id", None)
-            overall_data.pop("name", None)
-        else:
-            categories.append(cat_data)
-            if not is_total:
-                overall_planned += planned
-                overall_actual += actual
+        # Children with a plan of their own; their spending is already in the parent's actual
+        subcategories = []
+        for child in entry["subcategories"]:
+            child_planned = max(child["planned"], 0)
+            child_actual = actual_by_tag.get(child["tag_id"], 0.0)
+            if child_planned == 0 and child_actual == 0:
+                continue
+            child_metrics = _budget_metrics(
+                child_planned, child_actual, days_elapsed, days_total, days_remaining
+            )
+            sub_data = {
+                "tag_id": child["tag_id"],
+                "name": child["name"],
+                "planned": child_metrics["planned"],
+            }
+            if child["breakdown"]:
+                sub_data["planned_breakdown"] = child["breakdown"]
+            sub_data.update(
+                actual=child_metrics["actual"],
+                remaining=child_metrics["remaining"],
+                pct_used=child_metrics["pct_used"],
+                status=child_metrics["status"],
+            )
+            subcategories.append(sub_data)
+        if subcategories:
+            subcategories.sort(key=sort_key, reverse=True)
+            cat_data["subcategories"] = subcategories
 
-    # Sort categories by pct_used descending (most critical first)
-    categories.sort(key=lambda x: x["pct_used"], reverse=True)
+        categories.append(cat_data)
+        overall_actual += actual
+
+    categories.sort(key=sort_key, reverse=True)
 
     result = {
         "month": f"{target_year:04d}-{target_month:02d}",
@@ -1419,38 +1618,47 @@ def check_budget_health(
         "categories": categories,
     }
 
-    # Build overall from accumulated totals (not from the "000..." total budget row
-    # which has no real transactions mapped to it)
+    # Overall: the month total when one is set, otherwise the sum of the categories.
+    # A budget for the whole month is measured against everything spent in it;
+    # a sum of category budgets only against the spending in those categories.
+    overall_plan = plan["overall"]
+    overall_planned = overall_plan["planned"]
+    if overall_plan["source"] == "category_budgets":
+        actual_scope = "budgeted_categories"
+    else:
+        overall_actual = sum(actual_by_root.values(), 0.0)
+        actual_scope = "all_spending"
+
     if overall_planned > 0 or overall_actual > 0:
-        overall_remaining = overall_planned - overall_actual
-        overall_pct_used = (overall_actual / overall_planned * 100) if overall_planned > 0 else 0
-        overall_daily_remaining = (overall_remaining / days_remaining) if days_remaining > 0 else 0
+        overall = _budget_metrics(
+            overall_planned, overall_actual, days_elapsed, days_total, days_remaining
+        )
+        overall["planned_source"] = overall_plan["source"]
+        if "breakdown" in overall_plan:
+            overall["planned_breakdown"] = overall_plan["breakdown"]
+        overall["actual_scope"] = actual_scope
+        result["overall"] = overall
 
-        if overall_pct_used < 80:
-            overall_status = "on_track"
-        elif overall_pct_used < 100:
-            overall_status = "warning"
-        else:
-            overall_status = "overspent"
-
-        month_progress = days_elapsed / days_total if days_total > 0 else 0
-        spend_progress = overall_pct_used / 100 if overall_planned > 0 else 0
-        if spend_progress > month_progress * 1.1:
-            overall_pace = "ahead_of_pace"
-        elif spend_progress < month_progress * 0.9:
-            overall_pace = "behind_pace"
-        else:
-            overall_pace = "on_pace"
-
-        result["overall"] = {
-            "planned": round(overall_planned, 2),
-            "actual": round(overall_actual, 2),
-            "remaining": round(overall_remaining, 2),
-            "pct_used": round(overall_pct_used, 1),
-            "daily_remaining": round(overall_daily_remaining, 2) if days_remaining > 0 else 0,
-            "status": overall_status,
-            "pace": overall_pace,
-        }
+    # Spending in top-level categories that have no budget at all
+    budgeted_roots = {entry["tag_id"] for entry in plan["entries"]}
+    unbudgeted = sorted(
+        (
+            {"name": root_names[root_id], "actual": round(amount, 2)}
+            for root_id, amount in actual_by_root.items()
+            if root_id not in budgeted_roots
+        ),
+        key=lambda x: x["actual"],
+        reverse=True,
+    )
+    unbudgeted_total = sum(
+        (amount for root_id, amount in actual_by_root.items() if root_id not in budgeted_roots), 0.0
+    )
+    result["unbudgeted"] = {
+        "total": round(unbudgeted_total, 2),
+        "total_categories": len(unbudgeted),
+        "returned_categories": min(len(unbudgeted), _UNBUDGETED_TOP_N),
+        "top_categories": unbudgeted[:_UNBUDGETED_TOP_N],
+    }
 
     return result
 
@@ -3594,9 +3802,12 @@ def get_categories_resource(db: Database) -> dict[str, Any]:
 
 
 def get_current_budgets_resource(db: Database) -> dict[str, Any]:
-    """R3: Get current month budgets for LLM context."""
-    conn = db.connect()
+    """R3: Get current month budgets for LLM context.
 
+    Expense plans by top-level category, built the same way as in
+    check_budget_health: scheduled operations and subcategories included,
+    the month total reported apart from the categories it covers.
+    """
     # Resolve the user's current BUDGET month (respects month_start_day), matching
     # check_budget_health. Using the calendar month would return the wrong budget
     # near the month boundary when month_start_day != 1.
@@ -3604,39 +3815,54 @@ def get_current_budgets_resource(db: Database) -> dict[str, Any]:
     month_start_day = db.get_user_month_start_day()
     target_year, target_month = _current_budget_month(month_start_day, today)
     budget_date = date(target_year, target_month, 1).isoformat()
+    period_start, period_end = _compute_budget_period(
+        month_start_day, target_year, target_month
+    )
 
-    rows = conn.execute("""
-        SELECT b.tag, b.outcome, b.outcome_lock, b.income, b.income_lock,
-               t.title as tag_title
-        FROM budgets b
-        LEFT JOIN tags t ON t.id = b.tag
-        WHERE b.date = ?
-        ORDER BY b.outcome DESC
-    """, (budget_date,)).fetchall()
+    _, currency_code, user_rate = _budget_currency(db)
+    plan = _load_budget_plan(db, budget_date, period_start, period_end, user_rate)
 
+    def budget_line(line: dict[str, Any]) -> dict[str, Any]:
+        data = {
+            "tag_id": line["tag_id"],
+            "tag_title": line["name"],
+            "planned_outcome": round(line["planned"], 2),
+            "outcome_locked": line["locked"],
+        }
+        if line["breakdown"]:
+            data["planned_breakdown"] = line["breakdown"]
+        return data
+
+    # A plan of zero or less is not a budget
     budgets = []
-    for row in rows:
-        tag_id = row["tag"]
-        tag_title = row["tag_title"]
+    for entry in plan["entries"]:
+        if entry["planned"] <= 0:
+            continue
+        budget = budget_line(entry)
+        subcategories = [budget_line(child) for child in entry["subcategories"] if child["planned"] > 0]
+        if subcategories:
+            subcategories.sort(key=lambda x: x["planned_outcome"], reverse=True)
+            budget["subcategories"] = subcategories
+        budgets.append(budget)
 
-        # Special case for total budget
-        if tag_id == "00000000-0000-0000-0000-000000000000":
-            tag_title = "Monthly total"
-        elif not tag_title:
-            tag_title = "Uncategorized"
+    budgets.sort(key=lambda x: x["planned_outcome"], reverse=True)
 
-        budgets.append({
-            "tag_id": tag_id,
-            "tag_title": tag_title,
-            "planned_outcome": row["outcome"],
-            "outcome_locked": bool(row["outcome_lock"]),
-            "planned_income": row["income"],
-            "income_locked": bool(row["income_lock"]),
-        })
+    overall = plan["overall"]
+    total = {
+        "tag_title": "Monthly total",
+        "planned_outcome": round(overall["planned"], 2),
+        "planned_source": overall["source"],
+    }
+    if "breakdown" in overall:
+        total["planned_breakdown"] = overall["breakdown"]
 
     return {
         "month": f"{target_year:04d}-{target_month:02d}",
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "currency": currency_code,
         "budgets": budgets,
+        "total": total,
     }
 
 

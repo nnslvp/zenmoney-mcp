@@ -320,13 +320,19 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="check_budget_health",
-            description="Check budget health: planned vs actual spending. Answers: 'Am I within budget?', 'Where am I overspending?'",
+            description=(
+                "Check budget health: planned vs actual spending. Answers: 'Am I within budget?', 'Where am I overspending?'. "
+                "Returns one entry per top-level category (budgets of its subcategories are nested inside and already "
+                "included in its numbers; scheduled payments are part of the plan, see planned_breakdown), "
+                "'overall' for the whole month (planned_source and actual_scope say what is compared) and "
+                "'unbudgeted': spending in categories that have no budget. Status 'no_budget' = money spent where nothing was planned."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "month": {
                         "type": "string",
-                        "description": "Month in 'YYYY-MM' format. Defaults to current budget period.",
+                        "description": "Budget month in 'YYYY-MM' format (e.g. '2026-03'); any other value is an error. Defaults to the current budget period.",
                     },
                 },
             },

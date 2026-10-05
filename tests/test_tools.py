@@ -965,8 +965,10 @@ class TestR3BudgetsResource:
         """Test that budgets are returned."""
         result = get_current_budgets_resource(populated_db)
 
-        # Fixture has 3 budgets for current month
-        assert len(result["budgets"]) == 3
+        # Fixture has 2 category budgets for current month; its untagged scheduled
+        # payments (rm1-rm3) are the plan for uncategorized expenses. The month
+        # total is reported apart from the categories.
+        assert {b["tag_title"] for b in result["budgets"]} == {"Еда", "Транспорт", "Uncategorized"}
 
     def test_budgets_resource_enrichment(self, populated_db: Database):
         """Test that budget tags have titles."""
@@ -978,16 +980,14 @@ class TestR3BudgetsResource:
             assert budget["tag_title"] is not None
 
     def test_budgets_total_budget(self, populated_db: Database):
-        """Test that total budget has special title."""
+        """Test that total budget has special title and is not listed among the categories."""
         result = get_current_budgets_resource(populated_db)
 
-        total_budget = next(
-            (b for b in result["budgets"] if b["tag_id"] == "00000000-0000-0000-0000-000000000000"),
-            None
-        )
+        total_budget = result["total"]
 
-        if total_budget:
-            assert total_budget["tag_title"] == "Monthly total"
+        assert total_budget["tag_title"] == "Monthly total"
+        assert total_budget["planned_outcome"] == 80000.0
+        assert all(b["tag_id"] != "00000000-0000-0000-0000-000000000000" for b in result["budgets"])
 
 
 class TestR4MerchantsResource:
@@ -1911,21 +1911,21 @@ class TestNegativePlannedBudget:
 
 
 class TestOverallBudgetTotals:
-    """Test that overall budget totals are computed from category sums."""
+    """Test that overall budget totals honour the month-total ('000...') row."""
 
-    def test_overall_totals_from_categories(self, populated_db: Database):
-        """FR-006: Overall should be accumulated from categories, not from '000...' row."""
+    def test_overall_totals_from_locked_month_total(self, populated_db: Database):
+        """FR-006: A locked '000...' row (80000 in the fixture) is the exact overall plan.
+
+        It is a budget for the whole month, so it is compared with all spending:
+        tx1 (1500) + tx2 (3000) + tx3 (500) + tx4 (uncategorized, 200) = 5200.
+        """
         result = check_budget_health(populated_db)
 
-        if "overall" in result:
-            overall = result["overall"]
-            # Overall planned should be sum of category planned amounts
-            category_planned = sum(c["planned"] for c in result["categories"])
-            category_actual = sum(c["actual"] for c in result["categories"])
-            assert overall["planned"] == pytest.approx(category_planned, abs=0.01)
-            assert overall["actual"] == pytest.approx(category_actual, abs=0.01)
-            assert "status" in overall
-            assert "pace" in overall
+        overall = result["overall"]
+        assert overall["planned"] == 80000.0
+        assert overall["actual"] == 5200.0
+        assert "status" in overall
+        assert "pace" in overall
 
 
 # ============================================================================
