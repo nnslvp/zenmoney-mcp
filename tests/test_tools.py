@@ -63,6 +63,67 @@ class TestPeriodDates:
         assert end == "2026-02-28"
 
 
+class TestPeriodValidation:
+    """A period the server cannot parse must fail loudly, never fall back silently."""
+
+    def test_rejects_non_iso_start_date(self):
+        with pytest.raises(ValueError, match="start_date"):
+            get_period_dates("this_month", start_date="01.09.2026", end_date="30.09.2026")
+
+    def test_rejects_non_iso_end_date(self):
+        with pytest.raises(ValueError, match="end_date"):
+            get_period_dates("this_month", start_date="2026-09-01", end_date="30/09/2026")
+
+    def test_datetime_string_keeps_its_day(self):
+        start, end = get_period_dates(
+            "this_month", start_date="2026-09-01T00:00:00", end_date="2026-09-30T23:59:59"
+        )
+        assert (start, end) == ("2026-09-01", "2026-09-30")
+
+    def test_rejects_end_date_without_start_date(self):
+        with pytest.raises(ValueError, match="start_date"):
+            get_period_dates("this_month", end_date="2026-09-30")
+
+    def test_rejects_start_after_end(self):
+        with pytest.raises(ValueError, match="after"):
+            get_period_dates("this_month", start_date="2026-09-30", end_date="2026-09-01")
+
+    @pytest.mark.parametrize("period", ["September", "2026-13", "2026-1-1", "last_days", ""])
+    def test_rejects_unknown_period(self, period):
+        with pytest.raises(ValueError, match="Unknown period"):
+            get_period_dates(period)
+
+    def test_last_30_days_spans_exactly_30_days(self):
+        start, end = get_period_dates("last_30_days")
+        today = date.today()
+        assert end == today.isoformat()
+        assert start == (today - timedelta(days=29)).isoformat()
+
+    def test_last_n_days(self):
+        start, end = get_period_dates("last_7_days")
+        today = date.today()
+        assert (start, end) == ((today - timedelta(days=6)).isoformat(), today.isoformat())
+
+    def test_this_year(self):
+        year = date.today().year
+        assert get_period_dates("this_year") == (f"{year}-01-01", f"{year}-12-31")
+
+    def test_last_year(self):
+        year = date.today().year - 1
+        assert get_period_dates("last_year") == (f"{year}-01-01", f"{year}-12-31")
+
+    def test_yyyy_format(self):
+        assert get_period_dates("2024") == ("2024-01-01", "2024-12-31")
+
+    def test_leap_february(self):
+        assert get_period_dates("2024-02") == ("2024-02-01", "2024-02-29")
+
+    def test_malformed_dates_do_not_widen_the_query(self, populated_db: Database):
+        """'01.09.2026' used to compare as a string and return the whole history."""
+        with pytest.raises(ValueError, match="start_date"):
+            analyze_spending(populated_db, start_date="01.09.2026", end_date="30.09.2026")
+
+
 class TestT1GetNetWorth:
     """Test T1: get_net_worth tool."""
 
@@ -288,17 +349,22 @@ class TestT3AnalyzeSpending:
 
         categories = {c["name"]: c for c in result["categories"]}
 
-        # Продукты: tx1 (1500) - child of Еда
-        # Рестораны: tx2 (3000) - child of Еда
+        # Еда: its children are folded into it
+        #   Продукты: tx1 (1500)
+        #   Рестораны: tx2 (3000)
         # Транспорт: tx3 (500)
         # tx4 (200) - uncategorized
 
-        assert "Продукты" in categories
-        assert categories["Продукты"]["amount"] == 1500.0
-        assert categories["Продукты"]["count"] == 1
+        assert categories["Еда"]["amount"] == 4500.0
+        assert categories["Еда"]["count"] == 2
+        subcategories = {s["name"]: s for s in categories["Еда"]["subcategories"]}
 
-        assert "Рестораны" in categories
-        assert categories["Рестораны"]["amount"] == 3000.0
+        assert "Продукты" in subcategories
+        assert subcategories["Продукты"]["amount"] == 1500.0
+        assert subcategories["Продукты"]["count"] == 1
+
+        assert "Рестораны" in subcategories
+        assert subcategories["Рестораны"]["amount"] == 3000.0
 
         assert "Транспорт" in categories
         assert categories["Транспорт"]["amount"] == 500.0
@@ -318,7 +384,7 @@ class TestT3AnalyzeSpending:
         for cat in result["categories"]:
             # Name should be human-readable, not UUID
             assert not cat["name"].startswith("tag-")
-            assert cat["name"] in ["Продукты", "Рестораны", "Транспорт"]
+            assert cat["name"] in ["Еда", "Транспорт"]
 
 
 class TestT4AnalyzeIncome:
@@ -687,8 +753,8 @@ class TestT8AnalyzeTrends:
         """Test that data contains monthly entries."""
         result = analyze_trends(populated_db, months=3)
 
-        # Should have 3 months of data
-        assert len(result["data"]) == 3
+        # The fixture's history starts this month: the two months before it are omitted
+        assert len(result["data"]) == 1
 
         # Each month should have required fields
         for month_data in result["data"]:
@@ -834,7 +900,8 @@ class TestR1AccountsResource:
         result = get_accounts_resource(populated_db)
 
         assert "accounts" in result
-        assert "total_in_user_currency" in result
+        assert "in_balance_total" in result
+        assert "off_balance_total" in result
         assert "user_currency" in result
 
     def test_accounts_resource_excludes_archived(self, populated_db: Database):
@@ -898,8 +965,10 @@ class TestR3BudgetsResource:
         """Test that budgets are returned."""
         result = get_current_budgets_resource(populated_db)
 
-        # Fixture has 3 budgets for current month
-        assert len(result["budgets"]) == 3
+        # Fixture has 2 category budgets for current month; its untagged scheduled
+        # payments (rm1-rm3) are the plan for uncategorized expenses. The month
+        # total is reported apart from the categories.
+        assert {b["tag_title"] for b in result["budgets"]} == {"Еда", "Транспорт", "Uncategorized"}
 
     def test_budgets_resource_enrichment(self, populated_db: Database):
         """Test that budget tags have titles."""
@@ -911,16 +980,14 @@ class TestR3BudgetsResource:
             assert budget["tag_title"] is not None
 
     def test_budgets_total_budget(self, populated_db: Database):
-        """Test that total budget has special title."""
+        """Test that total budget has special title and is not listed among the categories."""
         result = get_current_budgets_resource(populated_db)
 
-        total_budget = next(
-            (b for b in result["budgets"] if b["tag_id"] == "00000000-0000-0000-0000-000000000000"),
-            None
-        )
+        total_budget = result["total"]
 
-        if total_budget:
-            assert total_budget["tag_title"] == "Monthly total"
+        assert total_budget["tag_title"] == "Monthly total"
+        assert total_budget["planned_outcome"] == 80000.0
+        assert all(b["tag_id"] != "00000000-0000-0000-0000-000000000000" for b in result["budgets"])
 
 
 class TestR4MerchantsResource:
@@ -1350,14 +1417,14 @@ class TestT14GetAccountFlow:
         result = get_account_flow(populated_db, account_id="acc-rub", period="this_month")
 
         summary = result["summary"]
-        assert "total_income" in summary
-        assert "total_outcome" in summary
+        assert "income" in summary
+        assert "outcome" in summary
         assert "net_change" in summary
-        assert "transaction_count" in summary
+        assert "total_count" in result
 
         # acc-rub has: tx5 (+150000 income), tx1-tx4 (expenses), tx6/tx7/tx8 (transfers out)
-        assert summary["total_income"] > 0
-        assert summary["total_outcome"] > 0
+        assert summary["income"] > 0
+        assert summary["outcome"] > 0
 
     def test_get_account_flow_transaction_breakdown(self, populated_db: Database):
         """Test that transactions are categorized."""
@@ -1396,7 +1463,7 @@ class TestT14GetAccountFlow:
         # acc-save has only tx6, but might have empty periods
         result = get_account_flow(populated_db, account_id="acc-save", period="2020-01")
 
-        assert result["summary"]["transaction_count"] == 0
+        assert result["total_count"] == 0
         assert len(result["transactions"]) == 0
 
 
@@ -1646,6 +1713,35 @@ class TestSyncRetry:
     """Test sync retry and timeout behavior."""
 
     @pytest.mark.asyncio
+    async def test_first_sync_uses_300s_timeout(self, db: Database):
+        """An empty cache downloads the whole history, same as force_full."""
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        engine = SyncEngine(db, "test_token")
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"serverTimestamp": 100}
+
+        captured_timeout = None
+
+        async def mock_post(*args, **kwargs):
+            nonlocal captured_timeout
+            captured_timeout = kwargs.get("timeout")
+            return mock_response
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = mock_post
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client_cls.return_value = mock_client
+
+            await engine.sync()
+
+        assert captured_timeout == 300.0
+
+    @pytest.mark.asyncio
     async def test_sync_force_full_retries_on_remote_protocol_error(self, db: Database):
         """BUG-001: force_full=True should retry on RemoteProtocolError."""
         import httpx
@@ -1714,6 +1810,7 @@ class TestSyncRetry:
         import httpx
         from unittest.mock import AsyncMock, patch, MagicMock
 
+        db.set_server_timestamp(50)  # the cache has synced before
         engine = SyncEngine(db, "test_token")
 
         mock_response = MagicMock()
@@ -1814,21 +1911,21 @@ class TestNegativePlannedBudget:
 
 
 class TestOverallBudgetTotals:
-    """Test that overall budget totals are computed from category sums."""
+    """Test that overall budget totals honour the month-total ('000...') row."""
 
-    def test_overall_totals_from_categories(self, populated_db: Database):
-        """FR-006: Overall should be accumulated from categories, not from '000...' row."""
+    def test_overall_totals_from_locked_month_total(self, populated_db: Database):
+        """FR-006: A locked '000...' row (80000 in the fixture) is the exact overall plan.
+
+        It is a budget for the whole month, so it is compared with all spending:
+        tx1 (1500) + tx2 (3000) + tx3 (500) + tx4 (uncategorized, 200) = 5200.
+        """
         result = check_budget_health(populated_db)
 
-        if "overall" in result:
-            overall = result["overall"]
-            # Overall planned should be sum of category planned amounts
-            category_planned = sum(c["planned"] for c in result["categories"])
-            category_actual = sum(c["actual"] for c in result["categories"])
-            assert overall["planned"] == pytest.approx(category_planned, abs=0.01)
-            assert overall["actual"] == pytest.approx(category_actual, abs=0.01)
-            assert "status" in overall
-            assert "pace" in overall
+        overall = result["overall"]
+        assert overall["planned"] == 80000.0
+        assert overall["actual"] == 5200.0
+        assert "status" in overall
+        assert "pace" in overall
 
 
 # ============================================================================
@@ -2014,7 +2111,7 @@ class TestOutOfBalanceInNetWorth:
         assert "accounts" in result["out_of_balance"]
 
     def test_out_of_balance_included_in_net_worth(self, populated_db: Database):
-        """ISSUE-001: out_of_balance total should be included in net_worth."""
+        """ISSUE-001: off-balance accounts count towards net_worth once, inside their type group."""
         result = get_net_worth(populated_db)
         breakdown = result["breakdown"]
         expected = (
@@ -2022,9 +2119,11 @@ class TestOutOfBalanceInNetWorth:
             + breakdown["savings"]["total"]
             + breakdown["loans"]["total"]
             + breakdown["debts"]["total"]
-            + result["out_of_balance"]["total"]
         )
         assert result["net_worth"] == pytest.approx(expected, abs=0.01)
+
+        grouped_ids = {acc["id"] for group in breakdown.values() for acc in group["accounts"]}
+        assert {acc["id"] for acc in result["out_of_balance"]["accounts"]} <= grouped_ids
 
 
 # ============================================================================
@@ -2052,8 +2151,8 @@ class TestRecurringDedup:
         netflix = next((r for r in reminder_items if r["name"] == "Netflix"), None)
         assert netflix is not None
         assert "yearly_cost" in netflix
-        # monthly: 500 * (365/30) ≈ 6083.33
-        assert netflix["yearly_cost"] == pytest.approx(500 * 365 / 30, abs=1.0)
+        # monthly: 12 payments a year
+        assert netflix["yearly_cost"] == 500 * 12
 
     def test_dedup_skips_detected_names(self, populated_db: Database):
         """ISSUE-005: Reminders with names already detected should be skipped."""
@@ -2063,7 +2162,8 @@ class TestRecurringDedup:
 
         # Insert repeated transactions to be detected as recurring
         for i in range(3):
-            month_start = date(today.year, today.month - 2 + i, 1) if today.month > 2 else date(today.year - 1, today.month + 10 + i, 1)
+            year, month_index = divmod(today.year * 12 + today.month - 1 - 2 + i, 12)
+            month_start = date(year, month_index + 1, 1)
             conn.execute(
                 """INSERT INTO transactions
                 (id, date, user, deleted, hold, income, income_instrument, income_account,

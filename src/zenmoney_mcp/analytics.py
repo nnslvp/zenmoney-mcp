@@ -1,6 +1,8 @@
 """Analytics business logic for ZenMoney MCP tools."""
 
+import calendar
 import json
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -10,60 +12,89 @@ from .database import Database
 from .utils import convert_to_user_currency
 
 
+PERIOD_FORMATS = (
+    "'this_month', 'last_month', 'this_year', 'last_year', "
+    "'last_N_days' (e.g. 'last_30_days'), 'YYYY-MM' or 'YYYY'"
+)
+
+_LAST_N_DAYS = re.compile(r"last_(\d+)_days")
+_YEAR_MONTH = re.compile(r"(\d{4})-(\d{2})")
+_YEAR = re.compile(r"\d{4}")
+
+
+def parse_iso_date(value: str, field: str) -> date:
+    """Parse a 'YYYY-MM-DD' date (a full ISO datetime is accepted, its time is dropped).
+
+    Dates are compared as strings in SQL, so anything else must be rejected here.
+    """
+    try:
+        return datetime.fromisoformat(value.strip()).date()
+    except (ValueError, AttributeError):
+        raise ValueError(f"Invalid {field} {value!r}: expected YYYY-MM-DD") from None
+
+
+def _month_bounds(year: int, month: int) -> tuple[date, date]:
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
+
+
+def _named_period_bounds(period: str, today: date) -> tuple[date, date] | None:
+    if period == "this_month":
+        return _month_bounds(today.year, today.month)
+    if period == "last_month":
+        last_day = today.replace(day=1) - timedelta(days=1)
+        return _month_bounds(last_day.year, last_day.month)
+    if period == "this_year":
+        return date(today.year, 1, 1), date(today.year, 12, 31)
+    if period == "last_year":
+        return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
+    if match := _LAST_N_DAYS.fullmatch(period):
+        days = int(match.group(1))
+        if days >= 1:
+            return today - timedelta(days=days - 1), today
+    if match := _YEAR_MONTH.fullmatch(period):
+        year, month = int(match.group(1)), int(match.group(2))
+        if year >= 1 and 1 <= month <= 12:
+            return _month_bounds(year, month)
+    if _YEAR.fullmatch(period) and int(period) >= 1:
+        return date(int(period), 1, 1), date(int(period), 12, 31)
+    return None
+
+
 def get_period_dates(
     period: str,
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> tuple[str, str]:
-    """Convert period string to start and end dates.
+    """Convert period string to start and end dates (both inclusive).
 
     Args:
-        period: One of "this_month", "last_month", "last_30_days", or "YYYY-MM"
+        period: One of PERIOD_FORMATS.
         start_date: Optional explicit start date (ISO format). Overrides period.
-        end_date: Optional explicit end date (ISO format). Used with start_date.
+        end_date: Optional explicit end date (ISO format). Defaults to today.
 
     Returns:
         Tuple of (start_date, end_date) as ISO strings.
-    """
-    if start_date:
-        if end_date:
-            return start_date, end_date
-        return start_date, date.today().isoformat()
 
+    Raises:
+        ValueError: If the period or a date cannot be parsed.
+    """
     today = date.today()
 
-    if period == "this_month":
-        start = today.replace(day=1)
-        # End of month
-        if today.month == 12:
-            end = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
-        else:
-            end = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
-    elif period == "last_month":
-        first_of_this_month = today.replace(day=1)
-        end = first_of_this_month - timedelta(days=1)
-        start = end.replace(day=1)
-    elif period == "last_30_days":
-        end = today
-        start = today - timedelta(days=30)
-    else:
-        # Assume YYYY-MM format
-        try:
-            year, month = map(int, period.split("-"))
-            start = date(year, month, 1)
-            if month == 12:
-                end = date(year + 1, 1, 1) - timedelta(days=1)
-            else:
-                end = date(year, month + 1, 1) - timedelta(days=1)
-        except (ValueError, AttributeError):
-            # Fallback to this month
-            start = today.replace(day=1)
-            if today.month == 12:
-                end = today.replace(year=today.year + 1, month=1, day=1) - timedelta(days=1)
-            else:
-                end = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
+    if start_date or end_date:
+        if not start_date:
+            raise ValueError("end_date requires start_date")
+        start = parse_iso_date(start_date, "start_date")
+        end = parse_iso_date(end_date, "end_date") if end_date else today
+        if start > end:
+            raise ValueError(f"start_date {start} is after end_date {end}")
+        return start.isoformat(), end.isoformat()
 
-    return start.isoformat(), end.isoformat()
+    bounds = _named_period_bounds(period, today) if isinstance(period, str) else None
+    if bounds is None:
+        raise ValueError(
+            f"Unknown period {period!r}. Use {PERIOD_FORMATS}, or pass start_date/end_date."
+        )
+    return bounds[0].isoformat(), bounds[1].isoformat()
 
 
 def get_net_worth(db: Database) -> dict[str, Any]:
@@ -71,8 +102,14 @@ def get_net_worth(db: Database) -> dict[str, Any]:
 
     T1: "How much money do I have?"
 
+    Every non-archived account is counted once, in the group of its type, whether
+    or not it is in balance: the system debt account is always off-balance, and
+    savings are often kept off-balance too.
+
     Returns:
-        Dictionary with net_worth breakdown by account type.
+        Dictionary with net_worth, its breakdown by account type, in_balance_total
+        (the balance the ZenMoney app shows) and off_balance_total. out_of_balance
+        lists the off-balance accounts again; it is already part of the breakdown.
     """
     conn = db.connect()
 
@@ -89,7 +126,7 @@ def get_net_worth(db: Database) -> dict[str, Any]:
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     currency_symbol = currency_row["symbol"] if currency_row else "₽"
 
-    # Get all active accounts in balance
+    # Get all active accounts, in balance or not
     rows = conn.execute("""
         SELECT a.id, a.title, a.type, a.balance, a.credit_limit,
                a.in_balance, a.savings, a.instrument,
@@ -105,12 +142,13 @@ def get_net_worth(db: Database) -> dict[str, Any]:
     savings_accounts = []  # deposit, savings=1
     loans_accounts = []    # loan
     debts_accounts = []    # debt
-    out_of_balance = []    # in_balance = 0
+    out_of_balance = []    # in_balance = 0, also listed in their type group
 
     current_total = 0.0
     savings_total = 0.0
     loans_total = 0.0
     debts_total = 0.0
+    in_balance_total = 0.0
     out_of_balance_total = 0.0
 
     for row in rows:
@@ -130,12 +168,14 @@ def get_net_worth(db: Database) -> dict[str, Any]:
             "currency": row["currency"] or "???",
             "currency_symbol": row["currency_symbol"] or "?",
             "converted": round(converted, 2),
+            "in_balance": bool(row["in_balance"]),
         }
 
-        if not row["in_balance"]:
+        if row["in_balance"]:
+            in_balance_total += converted
+        else:
             out_of_balance.append(account_info)
             out_of_balance_total += converted
-            continue
 
         acc_type = row["type"]
         is_savings = row["savings"]
@@ -153,10 +193,12 @@ def get_net_worth(db: Database) -> dict[str, Any]:
             current_accounts.append(account_info)
             current_total += converted
 
-    net_worth = current_total + savings_total + loans_total + debts_total + out_of_balance_total
+    net_worth = current_total + savings_total + loans_total + debts_total
 
     return {
         "net_worth": round(net_worth, 2),
+        "in_balance_total": round(in_balance_total, 2),
+        "off_balance_total": round(out_of_balance_total, 2),
         "currency": currency_code,
         "currency_symbol": currency_symbol,
         "breakdown": {
@@ -192,13 +234,32 @@ def get_liquidity(
 
     T2: "How much liquid cash?", "Can I afford a purchase?"
 
+    Liquid funds are in-balance cash, cards and checking accounts. Savings
+    (deposits and accounts flagged as savings, in or off balance) are reported
+    separately and are only the second source in the affordability check.
+
+    liquid_own is a net figure: negative balances (overdrafts, used credit) are
+    subtracted for every account type and summed up in negative_balances_total.
+
     Args:
         db: Database instance.
-        target_amount: Optional target purchase amount to check affordability.
+        target_amount: Optional target purchase amount to check affordability,
+            in the user's main currency.
 
     Returns:
         Dictionary with liquid funds breakdown and affordability check.
+
+    Raises:
+        ValueError: If target_amount is negative or not a finite number.
     """
+    if target_amount is not None:
+        is_number = isinstance(target_amount, (int, float)) and not isinstance(target_amount, bool)
+        if not is_number or not 0 <= target_amount < float("inf"):
+            raise ValueError(
+                f"Invalid target_amount {target_amount!r}: expected a non-negative number "
+                "in the user's main currency"
+            )
+
     conn = db.connect()
 
     # Get user currency
@@ -213,20 +274,22 @@ def get_liquidity(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     currency_symbol = currency_row["symbol"] if currency_row else "₽"
 
-    # Get all non-archived accounts
+    # Get all non-archived accounts that hold own money. Debt and loan accounts
+    # are money owed by or to someone, never funds to spend.
     rows = conn.execute("""
         SELECT a.id, a.title, a.type, a.balance, a.credit_limit,
                a.in_balance, a.savings, a.instrument,
                i.short_title as currency, i.rate
         FROM accounts a
         LEFT JOIN instruments i ON i.id = a.instrument
-        WHERE a.archive = 0 AND a.in_balance = 1
+        WHERE a.archive = 0 AND a.type NOT IN ('debt', 'loan')
         ORDER BY a.type, a.balance DESC
     """).fetchall()
 
-    liquid_own = 0.0  # Own money in liquid accounts
+    liquid_own = 0.0  # Own money in liquid accounts, net of negative balances
     liquid_with_credit = 0.0  # Including available credit
     savings_accessible = 0.0  # Savings (less liquid)
+    negative_balances = 0.0  # Owed on overdrawn liquid accounts, part of liquid_own
 
     liquid_accounts = []
     credit_accounts = []
@@ -257,17 +320,27 @@ def get_liquidity(
         }
 
         # Categorize accounts
-        if acc_type in ("cash", "ccard", "checking", "emoney"):
-            # Liquid accounts
+        if acc_type == "deposit" or is_savings:
+            # Savings: accessible but less liquid. Counted in or off balance,
+            # savings are often kept off-balance.
+            account_info["in_balance"] = bool(row["in_balance"])
+            savings_accessible += converted_balance
+            savings_accounts.append(account_info)
+
+        elif row["in_balance"] and acc_type in ("cash", "ccard", "checking", "emoney"):
+            # Liquid accounts. A negative balance is money already owed, so it
+            # reduces own funds on a card just as on any other account; this is
+            # also the net figure the ZenMoney app shows as the balance.
+            liquid_own += converted_balance
+            if converted_balance < 0:
+                negative_balances += converted_balance
+
             if acc_type == "ccard":
-                # Credit card: own funds (if positive) + available credit
-                own_funds = max(0, converted_balance)
+                # Credit card: balance + available credit
                 available_credit = converted_balance + converted_credit if converted_credit > 0 else converted_balance
 
-                liquid_own += own_funds
                 liquid_with_credit += available_credit
 
-                account_info["own_funds"] = round(own_funds, 2)
                 account_info["available_credit"] = round(available_credit, 2)
                 account_info["credit_limit"] = round(converted_credit, 2)
 
@@ -277,20 +350,15 @@ def get_liquidity(
                     liquid_accounts.append(account_info)
             else:
                 # Cash, checking, emoney: all balance is liquid
-                liquid_own += converted_balance
                 liquid_with_credit += converted_balance
                 liquid_accounts.append(account_info)
-
-        elif acc_type == "deposit" or is_savings:
-            # Savings: accessible but less liquid
-            savings_accessible += converted_balance
-            savings_accounts.append(account_info)
 
     total_available = liquid_own + savings_accessible
 
     result = {
         "liquid_own": round(liquid_own, 2),
         "liquid_with_credit": round(liquid_with_credit, 2),
+        "negative_balances_total": round(negative_balances, 2),
         "savings_accessible": round(savings_accessible, 2),
         "total_available": round(total_available, 2),
         "currency": currency_code,
@@ -302,27 +370,42 @@ def get_liquidity(
         },
     }
 
-    # Target affordability check
+    # Target affordability check: own money first (liquid, then savings).
+    # Credit is borrowed money, so it is only mentioned as an alternative.
     if target_amount is not None:
+        needed_from_savings = 0.0
+        shortfall = 0.0
+
+        if liquid_own >= target_amount:
+            verdict = "affordable_from_liquid"
+            recommendation = "Affordable from liquid funds"
+        elif total_available >= target_amount:
+            verdict = "affordable_with_savings"
+            needed_from_savings = target_amount - liquid_own
+            recommendation = (
+                f"Affordable only by using savings: "
+                f"{round(needed_from_savings, 2)} {currency_code} must come from savings"
+            )
+        else:
+            verdict = "insufficient"
+            shortfall = target_amount - total_available
+            recommendation = (
+                f"Insufficient funds even with savings (short {round(shortfall, 2)} {currency_code})"
+            )
+
+        if verdict != "affordable_from_liquid" and liquid_with_credit >= target_amount:
+            recommendation += ". Alternatively, available credit covers it"
+
         result["target_check"] = {
             "target": target_amount,
+            "verdict": verdict,
+            "needed_from_savings": round(needed_from_savings, 2),
+            "shortfall": round(shortfall, 2),
             "affordable_from_liquid": liquid_own >= target_amount,
             "affordable_with_credit": liquid_with_credit >= target_amount,
             "affordable_with_savings": total_available >= target_amount,
+            "recommendation": recommendation,
         }
-
-        # Add recommendation
-        if liquid_own >= target_amount:
-            result["target_check"]["recommendation"] = "Affordable from own liquid funds"
-        elif liquid_with_credit >= target_amount:
-            shortfall = target_amount - liquid_own
-            result["target_check"]["recommendation"] = f"Need credit ({round(shortfall, 2)} {currency_code} shortfall)"
-        elif total_available >= target_amount:
-            shortfall = target_amount - liquid_with_credit
-            result["target_check"]["recommendation"] = f"Need to use savings ({round(shortfall, 2)} {currency_code} shortfall)"
-        else:
-            shortfall = target_amount - total_available
-            result["target_check"]["recommendation"] = f"Insufficient funds (short {round(shortfall, 2)} {currency_code})"
 
     return result
 
@@ -337,6 +420,7 @@ def analyze_spending(
     start_date: str | None = None,
     end_date: str | None = None,
     group_by: str = "category",
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze spending by categories.
 
@@ -346,18 +430,31 @@ def analyze_spending(
         db: Database instance.
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
         category_id: Optional category filter (includes children).
-        top_n: Number of top categories to return.
-        include_transfers: Include transfers in analysis.
+        top_n: Number of top categories to return (1-100).
+        include_transfers: Also count the outgoing side of transfers, currency
+            exchanges and debt operations. They add to the total and are reported
+            in "transfers_included", not under a category or merchant.
         include_holds: Include hold transactions.
         start_date: Optional explicit start date (ISO). Overrides period.
         end_date: Optional explicit end date (ISO). Used with start_date.
         group_by: Aggregation mode: "category" (default) or "merchant".
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded".
 
     Returns:
-        Dictionary with spending breakdown by categories.
+        Dictionary with spending breakdown by categories. Child categories are
+        folded into their parent and listed under its "subcategories"; with
+        category_id the category and its children come as a flat list.
+        Refunds (income on expense-only categories) do not reduce
+        "total_outcome"; they are reported in "refunds_total", "net_outcome"
+        and per category in "refunds".
     """
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
+    top_n = _clamp_top_n(top_n)
+    if group_by not in ("category", "merchant"):
+        raise ValueError(f"Unknown group_by {group_by!r}. Use 'category' or 'merchant'.")
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -371,40 +468,35 @@ def analyze_spending(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
-    # Build category filter if specified
-    category_ids = []
-    if category_id:
-        category_ids.append(category_id)
-        # Add children
-        children = conn.execute(
-            "SELECT id FROM tags WHERE parent = ?", (category_id,)
-        ).fetchall()
-        category_ids.extend(row["id"] for row in children)
+    # Build category filter if specified (the category and its children)
+    category_ids = _category_scope(db, category_id)
 
-    # Base query for expenses (get all, filter holds in Python to track excluded)
+    # Base query for expenses (get all, filter holds and off-balance accounts
+    # in Python to track what was excluded)
     query = """
         SELECT
             t.id,
             t.outcome,
             t.outcome_instrument,
+            t.income,
             t.tag,
             t.hold,
             t.merchant,
             t.payee,
-            m.title as merchant_title
+            m.title as merchant_title,
+            a.in_balance
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.outcome_account
         LEFT JOIN merchants m ON m.id = t.merchant
         WHERE t.deleted = 0
           AND t.date BETWEEN ? AND ?
           AND t.outcome > 0
-          AND t.income = 0
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
     """
     params: list[Any] = [start_date, end_date]
 
+    # Income on the other side marks a transfer, an exchange or a debt operation
     if not include_transfers:
-        query += " AND NOT (t.income > 0 AND t.outcome > 0)"
+        query += " AND t.income = 0"
 
     rows = conn.execute(query, params).fetchall()
 
@@ -412,6 +504,8 @@ def analyze_spending(
     category_totals: dict[str | None, dict[str, Any]] = {}
     merchant_totals: dict[str | None, dict[str, Any]] = {}
     holds_excluded = {"amount": 0.0, "count": 0}
+    off_balance_excluded = {"amount": 0.0, "count": 0}
+    transfers_included = {"amount": 0.0, "count": 0}
 
     for row in rows:
         # Filter holds in Python to track excluded amount
@@ -444,6 +538,19 @@ def analyze_spending(
             holds_excluded["count"] += 1
             continue
 
+        # Track off-balance accounts separately if not included
+        if row["in_balance"] == 0 and not include_off_balance:
+            off_balance_excluded["amount"] += amount
+            off_balance_excluded["count"] += 1
+            continue
+
+        # The outgoing side of a transfer counts towards the total, but it is
+        # neither a category nor a merchant
+        if row["income"] > 0:
+            transfers_included["amount"] += amount
+            transfers_included["count"] += 1
+            continue
+
         if primary_tag not in category_totals:
             category_totals[primary_tag] = {
                 "tag_id": primary_tag,
@@ -467,8 +574,29 @@ def analyze_spending(
         merchant_totals[merchant_key]["amount"] += amount
         merchant_totals[merchant_key]["count"] += 1
 
+    # Refunds are shown next to the spending they offset, not subtracted from it
+    refunds_total = 0.0
+    refunds = _refunds_by_tag(
+        db, start_date, end_date, include_off_balance, user_currency_id, user_rate
+    )
+    for tag_id, refunded in refunds.items():
+        if category_ids and tag_id not in category_ids:
+            continue
+        refunds_total += refunded
+        if tag_id not in category_totals:
+            category_totals[tag_id] = {
+                "tag_id": tag_id,
+                "amount": 0.0,
+                "count": 0,
+            }
+        category_totals[tag_id]["refunds"] = refunded
+
     # Calculate total
     total_outcome = sum(cat["amount"] for cat in category_totals.values())
+    total_outcome += transfers_included["amount"]
+    transfers_included["amount"] = round(transfers_included["amount"], 2)
+    holds_excluded["amount"] = round(holds_excluded["amount"], 2)
+    off_balance_excluded["amount"] = round(off_balance_excluded["amount"], 2)
 
     # If group_by == "merchant", return merchant aggregation
     if group_by == "merchant":
@@ -484,16 +612,23 @@ def analyze_spending(
             })
         merchants_list.sort(key=lambda x: x["amount"], reverse=True)
 
-        return {
+        result = {
             "period": {"start": start_date, "end": end_date},
             "total_outcome": round(total_outcome, 2),
+            "refunds_total": round(refunds_total, 2),
+            "net_outcome": round(total_outcome - refunds_total, 2),
             "currency": currency_code,
             "group_by": "merchant",
             "merchants": merchants_list[:top_n],
             "returned_count": min(len(merchants_list), top_n),
             "total_merchants": len(merchants_list),
             "holds_excluded": holds_excluded if holds_excluded["count"] > 0 else None,
+            "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
         }
+        if include_transfers:
+            result["transfers_included"] = transfers_included
+
+        return result
 
     # Get category names and parent info
     tag_info = {}
@@ -523,23 +658,55 @@ def analyze_spending(
 
     # Calculate percentages
     categories = []
-    for tag_id, data in category_totals.items():
-        info = tag_info.get(tag_id, {})
-        name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
-        parent_title = info.get("parent_title")
+    if category_id:
+        # Drill-down: the category and its children as a flat list
+        for tag_id, data in category_totals.items():
+            info = tag_info.get(tag_id, {})
+            name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
+            parent_title = info.get("parent_title")
 
-        cat_data = {
-            "tag_id": tag_id,
-            "name": name,
-            "amount": round(data["amount"], 2),
-            "share_pct": round(data["amount"] / total_outcome * 100, 1) if total_outcome > 0 else 0,
-            "count": data["count"],
-            "avg_check": round(data["amount"] / data["count"], 2) if data["count"] > 0 else 0,
-        }
-        if parent_title:
-            cat_data["parent_category"] = parent_title
+            cat_data = {
+                "tag_id": tag_id,
+                "name": name,
+                "amount": round(data["amount"], 2),
+                "share_pct": round(data["amount"] / total_outcome * 100, 1) if total_outcome > 0 else 0,
+                "count": data["count"],
+                "avg_check": round(data["amount"] / data["count"], 2) if data["count"] > 0 else 0,
+            }
+            if parent_title:
+                cat_data["parent_category"] = parent_title
+            if data.get("refunds"):
+                cat_data["refunds"] = round(data["refunds"], 2)
 
-        categories.append(cat_data)
+            categories.append(cat_data)
+    else:
+        # Overview: children are folded into their parent category
+        for top in _fold_into_parents(category_totals, tag_info):
+            cat_data = {
+                "tag_id": top["tag_id"],
+                "name": top["name"],
+                "amount": round(top["amount"], 2),
+                "share_pct": round(top["amount"] / total_outcome * 100, 1) if total_outcome > 0 else 0,
+                "count": top["count"],
+                "avg_check": round(top["amount"] / top["count"], 2) if top["count"] > 0 else 0,
+            }
+            if top["refunds"]:
+                cat_data["refunds"] = round(top["refunds"], 2)
+
+            subcategories = []
+            for part in top["parts"]:
+                line = {
+                    "tag_id": part["tag_id"],
+                    "name": part["name"],
+                    "amount": round(part["amount"], 2),
+                    "count": part["count"],
+                }
+                if part["refunds"]:
+                    line["refunds"] = round(part["refunds"], 2)
+                subcategories.append(line)
+            cat_data["subcategories"] = subcategories
+
+            categories.append(cat_data)
 
     # Sort by amount and limit
     categories.sort(key=lambda x: x["amount"], reverse=True)
@@ -556,13 +723,18 @@ def analyze_spending(
     result = {
         "period": {"start": start_date, "end": end_date},
         "total_outcome": round(total_outcome, 2),
+        "refunds_total": round(refunds_total, 2),
+        "net_outcome": round(total_outcome - refunds_total, 2),
         "currency": currency_code,
         "categories": categorized[:top_n],
         "returned_count": min(len(categorized), top_n),
         "total_categories": len(categorized),
         "uncategorized": uncategorized,
         "holds_excluded": holds_excluded if holds_excluded["count"] > 0 else None,
+        "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
     }
+    if include_transfers:
+        result["transfers_included"] = transfers_included
 
     # Add top_merchants when in drill-down mode (category_id is set)
     if category_id and merchant_totals:
@@ -580,12 +752,157 @@ def analyze_spending(
     return result
 
 
+_REPORT_TOP_N_MAX = 100
+
+
+def _count_arg(value: Any, name: str) -> int:
+    """Return ``value`` as an integer >= 1.
+
+    JSON has a single number type, so a whole number sent as a float (10.0) is accepted.
+
+    Raises:
+        ValueError: If ``value`` is anything else.
+    """
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be an integer >= 1, got {value!r}")
+    return value
+
+
+def _clamp_top_n(top_n: int) -> int:
+    """Validate ``top_n`` and cap it at ``_REPORT_TOP_N_MAX`` entries.
+
+    Raises:
+        ValueError: If ``top_n`` is not an integer >= 1.
+    """
+    return min(_count_arg(top_n, "top_n"), _REPORT_TOP_N_MAX)
+
+
+def _category_scope(db: Database, category_id: str | None) -> list[str]:
+    """Tag IDs a category filter covers: the category and its children.
+
+    Returns an empty list when no filter is set.
+
+    Raises:
+        ValueError: If the category does not exist.
+    """
+    if not category_id:
+        return []
+
+    conn = db.connect()
+    if not conn.execute("SELECT 1 FROM tags WHERE id = ?", (category_id,)).fetchone():
+        raise ValueError(
+            f"Unknown category {category_id!r}. "
+            "Category IDs are listed in the zenmoney://categories resource."
+        )
+    children = conn.execute(
+        "SELECT id FROM tags WHERE parent = ?", (category_id,)
+    ).fetchall()
+    return [category_id] + [row["id"] for row in children]
+
+
+def _fold_into_parents(
+    category_totals: dict[str | None, dict[str, Any]],
+    tag_info: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fold per-tag totals into top-level categories.
+
+    A child category adds its amount, count and refunds to its parent. "parts"
+    lists what an entry was built from, largest first: the children and, when
+    the parent has transactions of its own, the parent itself. It is empty when
+    there is nothing to break down (no children involved).
+
+    ``tag_info`` maps a tag to its "title", "parent" and "parent_title".
+    """
+    top_level: dict[str | None, dict[str, Any]] = {}
+
+    for tag_id, data in category_totals.items():
+        info = tag_info.get(tag_id, {})
+        name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
+        if info.get("parent_title"):
+            top_id, top_name = info["parent"], info["parent_title"]
+        else:
+            top_id, top_name = tag_id, name
+
+        if top_id not in top_level:
+            top_level[top_id] = {
+                "tag_id": top_id,
+                "name": top_name,
+                "amount": 0.0,
+                "count": 0,
+                "refunds": 0.0,
+                "parts": [],
+            }
+        top = top_level[top_id]
+        top["amount"] += data["amount"]
+        top["count"] += data["count"]
+        top["refunds"] += data.get("refunds", 0.0)
+        top["parts"].append({
+            "tag_id": tag_id,
+            "name": name,
+            "amount": data["amount"],
+            "count": data["count"],
+            "refunds": data.get("refunds", 0.0),
+        })
+
+    for top in top_level.values():
+        if all(part["tag_id"] == top["tag_id"] for part in top["parts"]):
+            top["parts"] = []
+        top["parts"].sort(key=lambda x: x["amount"], reverse=True)
+
+    return list(top_level.values())
+
+
+def _refunds_by_tag(
+    db: Database,
+    start_date: str,
+    end_date: str,
+    include_off_balance: bool,
+    user_currency_id: int,
+    user_rate: float,
+) -> dict[str, float]:
+    """Refunds per category in user currency.
+
+    A refund is income recorded on an expense-only category (show_outcome
+    without show_income). The rows are picked by the rules of analyze_income:
+    pure income, no holds, off-balance accounts only on request.
+    """
+    query = """
+        SELECT t.income, t.income_instrument, g.id as tag_id
+        FROM transactions t
+        JOIN tags g ON g.id = json_extract(t.tag, '$[0]')
+        LEFT JOIN accounts a ON a.id = t.income_account
+        WHERE t.deleted = 0
+          AND (t.hold IS NULL OR t.hold = 0)
+          AND t.date BETWEEN ? AND ?
+          AND t.income > 0
+          AND t.outcome = 0
+          AND g.show_outcome = 1
+          AND g.show_income = 0
+    """
+    if not include_off_balance:
+        query += " AND (a.in_balance = 1 OR a.in_balance IS NULL)"
+
+    refunds: dict[str, float] = {}
+    for row in db.connect().execute(query, (start_date, end_date)).fetchall():
+        amount = row["income"]
+        instrument_id = row["income_instrument"]
+        if instrument_id and instrument_id != user_currency_id:
+            source_rate = db.get_instrument_rate(instrument_id)
+            amount = amount * source_rate / user_rate if user_rate else amount
+        refunds[row["tag_id"]] = refunds.get(row["tag_id"], 0.0) + amount
+
+    return refunds
+
+
 def analyze_income(
     db: Database,
     period: str = "this_month",
     top_n: int = 10,
     start_date: str | None = None,
     end_date: str | None = None,
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze income by categories and sources.
 
@@ -594,15 +911,23 @@ def analyze_income(
     Args:
         db: Database instance.
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
-        top_n: Number of top categories/sources to return.
+        top_n: Number of top categories/sources to return (1-100).
         start_date: Optional explicit start date (ISO). Overrides period.
         end_date: Optional explicit end date (ISO). Used with start_date.
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded".
 
     Returns:
-        Dictionary with income breakdown by categories and sources.
+        Dictionary with income breakdown by categories and sources. Child
+        categories are folded into their parent and listed under its
+        "subcategories". Refunds (income on expense-only categories) stay in
+        "total_income"; their categories are marked "is_refund" and summed in
+        "refunds_total".
     """
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
+    top_n = _clamp_top_n(top_n)
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -616,7 +941,8 @@ def analyze_income(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
-    # Query for income transactions (pure income only, no transfers)
+    # Query for income transactions (pure income only, no transfers;
+    # off-balance accounts are filtered in Python to track what was excluded)
     query = """
         SELECT
             t.id,
@@ -625,7 +951,8 @@ def analyze_income(
             t.tag,
             t.merchant,
             t.payee,
-            t.original_payee
+            t.original_payee,
+            a.in_balance
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.income_account
         WHERE t.deleted = 0
@@ -633,7 +960,6 @@ def analyze_income(
           AND t.date BETWEEN ? AND ?
           AND t.income > 0
           AND t.outcome = 0
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
     """
     params: list[Any] = [start_date, end_date]
 
@@ -643,6 +969,7 @@ def analyze_income(
     category_totals: dict[str | None, dict[str, Any]] = {}
     # Aggregate by source (merchant/payee)
     source_totals: dict[str, dict[str, Any]] = {}
+    off_balance_excluded = {"amount": 0.0, "count": 0}
 
     for row in rows:
         # Parse primary tag
@@ -662,6 +989,12 @@ def analyze_income(
         if instrument_id and instrument_id != user_currency_id:
             source_rate = db.get_instrument_rate(instrument_id)
             amount = amount * source_rate / user_rate if user_rate else amount
+
+        # Track off-balance accounts separately if not included
+        if row["in_balance"] == 0 and not include_off_balance:
+            off_balance_excluded["amount"] += amount
+            off_balance_excluded["count"] += 1
+            continue
 
         # Aggregate by category
         if primary_tag not in category_totals:
@@ -685,18 +1018,31 @@ def analyze_income(
         source_totals[source_key]["amount"] += amount
         source_totals[source_key]["count"] += 1
 
-    # Get category names
+    # Get category names and parent info
     tag_info = {}
     if category_totals:
         tag_ids = [t for t in category_totals.keys() if t]
         if tag_ids:
             placeholders = ",".join("?" * len(tag_ids))
             tag_rows = conn.execute(
-                f"SELECT id, title, parent FROM tags WHERE id IN ({placeholders})",
+                f"""
+                SELECT t.id, t.title, t.parent, p.title as parent_title,
+                       t.show_income, t.show_outcome
+                FROM tags t
+                LEFT JOIN tags p ON p.id = t.parent
+                WHERE t.id IN ({placeholders})
+                """,
                 tag_ids
             ).fetchall()
             for tr in tag_rows:
-                tag_info[tr["id"]] = {"title": tr["title"], "parent": tr["parent"]}
+                tag_info[tr["id"]] = {
+                    "title": tr["title"],
+                    "parent": tr["parent"],
+                    "parent_title": tr["parent_title"],
+                }
+                # Income on an expense-only category is money coming back, not earnings
+                if tr["show_outcome"] == 1 and tr["show_income"] == 0:
+                    category_totals[tr["id"]]["refunds"] = category_totals[tr["id"]]["amount"]
 
     # Get merchant names
     merchant_ids = [s["merchant_id"] for s in source_totals.values() if s["merchant_id"]]
@@ -712,19 +1058,36 @@ def analyze_income(
     # Calculate totals
     total_income = sum(cat["amount"] for cat in category_totals.values())
 
-    # Format categories
+    # Format categories (children are folded into their parent category)
     categories = []
-    for tag_id, data in category_totals.items():
-        info = tag_info.get(tag_id, {})
-        name = info.get("title", "Uncategorized") if tag_id else "Uncategorized"
+    refunds_total = 0.0
+    for top in _fold_into_parents(category_totals, tag_info):
+        cat_data = {
+            "tag_id": top["tag_id"],
+            "name": top["name"],
+            "amount": round(top["amount"], 2),
+            "share_pct": round(top["amount"] / total_income * 100, 1) if total_income > 0 else 0,
+            "count": top["count"],
+        }
+        # A refund category: everything in it came back from purchases
+        if top["refunds"] and all(part["refunds"] for part in top["parts"]):
+            cat_data["is_refund"] = True
+        refunds_total += top["refunds"]
 
-        categories.append({
-            "tag_id": tag_id,
-            "name": name,
-            "amount": round(data["amount"], 2),
-            "share_pct": round(data["amount"] / total_income * 100, 1) if total_income > 0 else 0,
-            "count": data["count"],
-        })
+        subcategories = []
+        for part in top["parts"]:
+            line = {
+                "tag_id": part["tag_id"],
+                "name": part["name"],
+                "amount": round(part["amount"], 2),
+                "count": part["count"],
+            }
+            if part["refunds"]:
+                line["is_refund"] = True
+            subcategories.append(line)
+        cat_data["subcategories"] = subcategories
+
+        categories.append(cat_data)
 
     categories.sort(key=lambda x: x["amount"], reverse=True)
 
@@ -745,10 +1108,13 @@ def analyze_income(
         })
 
     sources.sort(key=lambda x: x["amount"], reverse=True)
+    off_balance_excluded["amount"] = round(off_balance_excluded["amount"], 2)
 
     return {
         "period": {"start": start_date, "end": end_date},
         "total_income": round(total_income, 2),
+        "refunds_total": round(refunds_total, 2),
+        "income_excluding_refunds": round(total_income - refunds_total, 2),
         "currency": currency_code,
         "categories": categories[:top_n],
         "sources": sources[:top_n],
@@ -756,6 +1122,7 @@ def analyze_income(
         "total_categories": len(categories),
         "returned_sources": min(len(sources), top_n),
         "total_sources": len(sources),
+        "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
     }
 
 
@@ -806,6 +1173,235 @@ def _current_budget_month(month_start_day: int, today: date) -> tuple[int, int]:
     return today.year, today.month - 1
 
 
+_BUDGET_TOTAL_TAG = "00000000-0000-0000-0000-000000000000"
+_UNBUDGETED_TOP_N = 5
+
+
+def _budget_currency(db: Database) -> tuple[int, str, float]:
+    """User's currency for budget figures: (instrument id, code, rate)."""
+    user_currency_id = db.get_user_currency()
+    if not user_currency_id:
+        user_currency_id = 2  # Default to RUB
+
+    currency_row = db.connect().execute(
+        "SELECT short_title, rate FROM instruments WHERE id = ?",
+        (user_currency_id,)
+    ).fetchone()
+    currency_code = currency_row["short_title"] if currency_row else "RUB"
+    user_rate = currency_row["rate"] if currency_row else 1.0
+    return user_currency_id, currency_code, user_rate
+
+
+def _load_budget_plan(
+    db: Database,
+    budget_date: str,
+    period_start: date,
+    period_end: date,
+    user_rate: float,
+) -> dict[str, Any]:
+    """Planned expenses of one budget month, grouped by top-level category.
+
+    Shared by check_budget_health and the budgets/current resource, so both
+    report the same numbers.
+
+    How a plan is built (ZenMoney API, Budget):
+      - a locked row is the exact budget of its category;
+      - an unlocked row is its stored amount plus the scheduled expenses
+        (reminder markers) of the category in the period. No row at all is the
+        same as an unlocked 0, so scheduled expenses alone make a plan too;
+      - an unlocked parent stores what is left over its children, so the plan
+        of a top-level category is its own amount plus the plans of its children;
+      - the month-total row works the same way one level up: locked it is the
+        exact plan of the month, unlocked it is added to the category plans.
+
+    Args:
+        db: Database instance.
+        budget_date: First day of the budget month ('YYYY-MM-01'), the key of budget rows.
+        period_start: First day of the budget period.
+        period_end: Last day of the budget period.
+        user_rate: Rate of the user's currency, scheduled amounts are converted to it.
+
+    Returns:
+        {"entries": [...], "overall": {"planned", "source", "breakdown"?}}. An entry
+        is one top-level category: tag_id, name, planned, locked, breakdown (None
+        for a plain stored amount) and its subcategories (children that have a
+        plan of their own). "overall" is the plan of the whole month.
+    """
+    conn = db.connect()
+    rate = user_rate or 1.0
+
+    budget_rows = conn.execute("""
+        SELECT b.tag, b.outcome, b.outcome_lock,
+               t.title AS title, t.parent AS parent_id, p.title AS parent_title
+        FROM budgets b
+        LEFT JOIN tags t ON t.id = b.tag
+        LEFT JOIN tags p ON p.id = t.parent
+        WHERE b.date = ?
+    """, (budget_date,)).fetchall()
+
+    # Scheduled expenses by category; a marker is in the currency of its account.
+    # Same in-balance rule as for actuals, so plan and actual cover the same accounts.
+    scheduled_rows = conn.execute("""
+        SELECT json_extract(rm.tag, '$[0]') AS tag,
+               t.title AS title, t.parent AS parent_id, p.title AS parent_title,
+               SUM(rm.outcome * COALESCE(i.rate, ?) / ?) AS total
+        FROM reminder_markers rm
+        LEFT JOIN accounts a ON a.id = rm.outcome_account
+        LEFT JOIN instruments i ON i.id = a.instrument
+        LEFT JOIN tags t ON t.id = json_extract(rm.tag, '$[0]')
+        LEFT JOIN tags p ON p.id = t.parent
+        WHERE rm.state IN ('planned', 'processed')
+          AND rm.outcome > 0 AND COALESCE(rm.income, 0) = 0
+          AND rm.date >= ? AND rm.date <= ?
+          AND (a.in_balance = 1 OR a.in_balance IS NULL)
+        GROUP BY json_extract(rm.tag, '$[0]')
+    """, (rate, rate, period_start.isoformat(), period_end.isoformat())).fetchall()
+
+    # One node per category that has a budget row or scheduled expenses
+    total = None
+    nodes: dict[str | None, dict[str, Any]] = {}
+
+    def node_for(row: Any) -> dict[str, Any]:
+        return nodes.setdefault(row["tag"], {
+            "tag_id": row["tag"],
+            "name": row["title"],
+            "parent_id": row["parent_id"],
+            "parent_name": row["parent_title"],
+            "budget": 0.0,
+            "locked": False,
+            "scheduled": 0.0,
+        })
+
+    for row in budget_rows:
+        if row["tag"] == _BUDGET_TOTAL_TAG:
+            total = {"budget": row["outcome"] or 0.0, "locked": bool(row["outcome_lock"])}
+            continue
+        node_for(row).update(budget=row["outcome"] or 0.0, locked=bool(row["outcome_lock"]))
+
+    for row in scheduled_rows:
+        node = node_for(row)
+        if not node["locked"]:
+            node["scheduled"] = row["total"]
+
+    # Group the nodes by top-level category; a child without a parent row still
+    # gets a parent entry (whose own budget is 0)
+    entries: dict[str | None, dict[str, Any]] = {}
+    for node in nodes.values():
+        is_child = bool(node["parent_id"])
+        root_id = node["parent_id"] if is_child else node["tag_id"]
+        root_name = node["parent_name"] if is_child else node["name"]
+        if root_id is None:
+            root_name = "Uncategorized"
+        entry = entries.setdefault(root_id, {
+            "tag_id": root_id,
+            "name": root_name or "Unknown category",
+            "budget": 0.0,
+            "locked": False,
+            "scheduled": 0.0,
+            "subcategories": [],
+        })
+        if is_child:
+            entry["subcategories"].append({
+                "tag_id": node["tag_id"],
+                "name": node["name"] or "Unknown category",
+                "planned": node["budget"] + node["scheduled"],
+                "locked": node["locked"],
+                "breakdown": {
+                    "budget": round(node["budget"], 2),
+                    "scheduled": round(node["scheduled"], 2),
+                } if node["scheduled"] else None,
+            })
+        else:
+            entry.update(budget=node["budget"], locked=node["locked"], scheduled=node["scheduled"])
+
+    # An unlocked parent stores what is left over its children; a locked one is exact
+    for entry in entries.values():
+        children_planned = 0.0
+        if not entry["locked"]:
+            children_planned = sum((child["planned"] for child in entry["subcategories"]), 0.0)
+        entry["planned"] = entry["budget"] + entry["scheduled"] + children_planned
+        # How the plan was built, when it is more than the stored amount
+        entry["breakdown"] = {
+            "budget": round(entry["budget"], 2),
+            "scheduled": round(entry["scheduled"], 2),
+            "subcategories": round(children_planned, 2),
+        } if entry["scheduled"] or children_planned else None
+
+    # The month total follows the same rule one level up. An unlocked total of 0
+    # is how the API spells "no budget", the same as no total row.
+    categories_planned = sum(max(entry["planned"], 0) for entry in entries.values())
+    if total is None or (not total["locked"] and total["budget"] == 0):
+        overall = {"planned": categories_planned, "source": "category_budgets"}
+    elif total["locked"] or categories_planned == 0:
+        overall = {"planned": total["budget"], "source": "month_total"}
+    else:
+        overall = {
+            "planned": total["budget"] + categories_planned,
+            "source": "month_total_plus_category_budgets",
+            "breakdown": {
+                "month_total": round(total["budget"], 2),
+                "categories": round(categories_planned, 2),
+            },
+        }
+
+    return {"entries": list(entries.values()), "overall": overall}
+
+
+def _budget_metrics(
+    planned: float,
+    actual: float,
+    days_elapsed: int,
+    days_total: int,
+    days_remaining: int,
+) -> dict[str, Any]:
+    """Plan vs actual figures of one budget line (category, subcategory or month total)."""
+    if planned <= 0:
+        # Nothing is planned here: there is no budget to measure the spending against
+        return {
+            "planned": 0.0,
+            "actual": round(actual, 2),
+            "remaining": None,
+            "pct_used": None,
+            "daily_remaining": None,
+            "status": "no_budget",
+            "pace": None,
+        }
+
+    remaining = planned - actual
+    pct_used = actual / planned * 100
+    daily_remaining = (remaining / days_remaining) if days_remaining > 0 else 0
+
+    # Determine status; spending exactly the plan (a scheduled bill paid in full)
+    # uses the budget up but does not overspend it
+    if round(actual - planned, 2) > 0:
+        status = "overspent"
+    elif pct_used >= 80:
+        status = "warning"
+    else:
+        status = "on_track"
+
+    # Calculate pace
+    month_progress = days_elapsed / days_total if days_total > 0 else 0
+    spend_progress = pct_used / 100
+
+    if spend_progress > month_progress * 1.1:
+        pace = "ahead_of_pace"
+    elif spend_progress < month_progress * 0.9:
+        pace = "behind_pace"
+    else:
+        pace = "on_pace"
+
+    return {
+        "planned": round(planned, 2),
+        "actual": round(actual, 2),
+        "remaining": round(remaining, 2),
+        "pct_used": round(pct_used, 1),
+        "daily_remaining": round(daily_remaining, 2) if days_remaining > 0 else 0,
+        "status": status,
+        "pace": pace,
+    }
+
+
 def check_budget_health(
     db: Database,
     month: str | None = None,
@@ -816,22 +1412,35 @@ def check_budget_health(
 
     Args:
         db: Database instance.
-        month: Month in "YYYY-MM" format. If None, uses current month.
+        month: Budget month in "YYYY-MM" format. If None, uses current budget month.
 
     Returns:
-        Dictionary with budget health status for each category.
+        Dictionary with budget health status:
+          - categories: one entry per top-level category that has a plan, with
+            planned / actual / remaining / pct_used / status / pace. Children
+            with a plan of their own are nested as "subcategories"; their
+            amounts are already inside the parent's. "planned_breakdown" shows
+            how a plan was built when scheduled operations or subcategories
+            add to the stored amount. Status "no_budget" marks spending against
+            a plan of zero.
+          - overall: the month as a whole. "planned_source" and "actual_scope"
+            say what is compared: with a month-total budget, all spending of
+            the month; without one, the budgeted categories only.
+          - unbudgeted: spending in categories that have no budget at all.
+
+    Raises:
+        ValueError: If month is not a valid "YYYY-MM".
     """
     conn = db.connect()
     today = date.today()
     month_start_day = db.get_user_month_start_day()
 
     # Determine period and budget month
-    if month:
-        try:
-            target_year, target_month = map(int, month.split("-"))
-            date(target_year, target_month, 1)  # validate
-        except (ValueError, AttributeError):
-            target_year, target_month = _current_budget_month(month_start_day, today)
+    if month is not None:
+        match = _YEAR_MONTH.fullmatch(month) if isinstance(month, str) else None
+        target_year, target_month = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+        if target_year < 1 or not 1 <= target_month <= 12:
+            raise ValueError(f"Invalid month {month!r}: expected YYYY-MM (e.g. '2026-03')")
         period_start, period_end = _compute_budget_period(
             month_start_day, target_year, target_month
         )
@@ -860,26 +1469,12 @@ def check_budget_health(
     days_remaining = max(0, days_total - days_elapsed)
 
     # Get user currency
-    user_currency_id = db.get_user_currency()
-    if not user_currency_id:
-        user_currency_id = 2  # Default to RUB
+    user_currency_id, currency_code, user_rate = _budget_currency(db)
 
-    currency_row = conn.execute(
-        "SELECT short_title, rate FROM instruments WHERE id = ?",
-        (user_currency_id,)
-    ).fetchone()
-    currency_code = currency_row["short_title"] if currency_row else "RUB"
-    user_rate = currency_row["rate"] if currency_row else 1.0
+    # Load the plan for this month
+    plan = _load_budget_plan(db, budget_date, period_start, period_end, user_rate)
 
-    # Load budgets for this month
-    budget_rows = conn.execute("""
-        SELECT b.tag, b.outcome, b.outcome_lock, t.title as tag_title
-        FROM budgets b
-        LEFT JOIN tags t ON t.id = b.tag
-        WHERE b.date = ?
-    """, (budget_date,)).fetchall()
-
-    if not budget_rows:
+    if not plan["entries"] and plan["overall"]["source"] == "category_budgets":
         return {
             "month": f"{target_year:04d}-{target_month:02d}",
             "period_start": period_start.isoformat(),
@@ -895,39 +1490,52 @@ def check_budget_health(
     month_start = period_start.isoformat()
     month_end = period_end.isoformat()
 
+    # Actual spending of the period, every transaction once: by category and by
+    # top-level category (a parent includes its children)
+    actual_rows = conn.execute("""
+        SELECT json_extract(t.tag, '$[0]') AS tag_id,
+               COALESCE(tg.parent, json_extract(t.tag, '$[0]')) AS root_id,
+               COALESCE(p.title, tg.title) AS root_name,
+               t.outcome_instrument,
+               SUM(t.outcome) AS outcome
+        FROM transactions t
+        LEFT JOIN accounts a ON a.id = t.outcome_account
+        LEFT JOIN tags tg ON tg.id = json_extract(t.tag, '$[0]')
+        LEFT JOIN tags p ON p.id = tg.parent
+        WHERE t.deleted = 0
+          AND (t.hold IS NULL OR t.hold = 0)
+          AND NOT (t.income > 0 AND t.outcome > 0)
+          AND t.outcome > 0
+          AND t.income = 0
+          AND t.date >= ? AND t.date <= ?
+          AND (a.in_balance = 1 OR a.in_balance IS NULL)
+        GROUP BY json_extract(t.tag, '$[0]'), t.outcome_instrument
+    """, (month_start, month_end)).fetchall()
+
+    actual_by_tag: dict[str | None, float] = {}
+    actual_by_root: dict[str | None, float] = {}
+    root_names: dict[str | None, str] = {None: "Uncategorized"}
+    for row in actual_rows:
+        amount = row["outcome"]
+        instrument_id = row["outcome_instrument"]
+        if instrument_id and instrument_id != user_currency_id:
+            source_rate = db.get_instrument_rate(instrument_id)
+            amount = amount * source_rate / user_rate if user_rate else amount
+        actual_by_tag[row["tag_id"]] = actual_by_tag.get(row["tag_id"], 0.0) + amount
+        actual_by_root[row["root_id"]] = actual_by_root.get(row["root_id"], 0.0) + amount
+        root_names.setdefault(row["root_id"], row["root_name"] or "Unknown category")
+
+    # Most critical first, lines without a budget last
+    def sort_key(line: dict[str, Any]) -> tuple[bool, float]:
+        has_budget = line["pct_used"] is not None
+        return has_budget, line["pct_used"] if has_budget else line["actual"]
+
     categories = []
-    overall_planned = 0.0
     overall_actual = 0.0
 
-    for budget_row in budget_rows:
-        tag_id = budget_row["tag"]
-        tag_title = budget_row["tag_title"]
-        budget_outcome = budget_row["outcome"] or 0
-        outcome_lock = budget_row["outcome_lock"]
-
-        # Special handling for total budget and null category
-        if tag_id == "00000000-0000-0000-0000-000000000000":
-            tag_title = "Monthly total"
-            is_total = True
-        elif not tag_title:
-            tag_title = "Uncategorized"
-            is_total = False
-        else:
-            is_total = False
-
-        # Calculate planned amount
-        if outcome_lock:
-            planned = budget_outcome
-        else:
-            # Include planned reminder markers
-            reminder_sum = conn.execute("""
-                SELECT COALESCE(SUM(outcome), 0) as total
-                FROM reminder_markers
-                WHERE state = 'planned'
-                  AND date >= ? AND date <= ?
-                  AND tag = ?
-            """, (month_start, month_end, tag_id)).fetchone()["total"]
-            planned = budget_outcome + reminder_sum
+    for entry in plan["entries"]:
+        planned = entry["planned"]
+        actual = actual_by_root.get(entry["tag_id"], 0.0)
 
         # Clamp negative planned to 0
         planned_warning = None
@@ -935,111 +1543,69 @@ def check_budget_health(
             planned_warning = f"Computed planned was {round(planned, 2)}, clamped to 0"
             planned = 0
 
-        # Calculate actual spending for this tag
-        # Include children tags
-        tag_ids = [tag_id] if tag_id else []
-        if tag_id and not is_total:
-            children = conn.execute(
-                "SELECT id FROM tags WHERE parent = ?", (tag_id,)
-            ).fetchall()
-            tag_ids.extend(row["id"] for row in children)
-
-        if tag_ids:
-            placeholders = ",".join("?" * len(tag_ids))
-            actual_query = f"""
-                SELECT t.outcome, t.outcome_instrument
-                FROM transactions t
-                LEFT JOIN accounts a ON a.id = t.outcome_account
-                WHERE t.deleted = 0
-                  AND (t.hold IS NULL OR t.hold = 0)
-                  AND NOT (t.income > 0 AND t.outcome > 0)
-                  AND t.outcome > 0
-                  AND t.income = 0
-                  AND t.date >= ? AND t.date <= ?
-                  AND json_extract(t.tag, '$[0]') IN ({placeholders})
-                  AND (a.in_balance = 1 OR a.in_balance IS NULL)
-            """
-            params = [month_start, month_end] + tag_ids
-            actual_rows = conn.execute(actual_query, params).fetchall()
-
-            actual = 0.0
-            for row in actual_rows:
-                amount = row["outcome"]
-                instrument_id = row["outcome_instrument"]
-                if instrument_id and instrument_id != user_currency_id:
-                    source_rate = db.get_instrument_rate(instrument_id)
-                    amount = amount * source_rate / user_rate if user_rate else amount
-                actual += amount
-        else:
-            actual = 0.0
-
-        # Skip if both planned and actual are zero (except for total)
-        if not is_total and planned == 0 and actual == 0:
+        # Skip if both planned and actual are zero
+        if planned == 0 and actual == 0:
             continue
 
-        # Calculate metrics
-        remaining = planned - actual
-        pct_used = (actual / planned * 100) if planned > 0 else 0
-        daily_remaining = (remaining / days_remaining) if days_remaining > 0 else 0
-
-        # Determine status
-        if pct_used < 80:
-            status = "on_track"
-        elif pct_used < 100:
-            status = "warning"
-        else:
-            status = "overspent"
-
-        # Calculate pace
-        month_progress = days_elapsed / days_total if days_total > 0 else 0
-        spend_progress = pct_used / 100 if planned > 0 else 0
-
-        if spend_progress > month_progress * 1.1:
-            pace = "ahead_of_pace"
-        elif spend_progress < month_progress * 0.9:
-            pace = "behind_pace"
-        else:
-            pace = "on_pace"
+        metrics = _budget_metrics(planned, actual, days_elapsed, days_total, days_remaining)
+        cat_data = {"tag_id": entry["tag_id"], "name": entry["name"], "planned": metrics["planned"]}
+        if entry["breakdown"]:
+            cat_data["planned_breakdown"] = entry["breakdown"]
+        cat_data.update(metrics)
 
         # Generate insight
         insight = None
-        if status == "overspent":
+        if metrics["status"] == "overspent":
             overspend = actual - planned
             insight = f"Overspent by {round(overspend, 2)} {currency_code}"
-        elif status == "warning" and pace == "ahead_of_pace" and days_remaining > 0:
+        elif (
+            metrics["status"] == "warning" and metrics["pace"] == "ahead_of_pace"
+            and days_remaining > 0
+            and days_elapsed > 0  # a future month has no pace yet
+            and metrics["remaining"] > 0  # nothing left to exhaust when the plan is used up
+        ):
+            remaining = planned - actual
             days_until_depleted = int(remaining / (actual / days_elapsed)) if actual > 0 else days_remaining
             if days_until_depleted < days_remaining:
                 insight = f"At current pace, budget will be exhausted in {days_until_depleted} days"
-
-        cat_data = {
-            "tag_id": tag_id,
-            "name": tag_title,
-            "planned": round(planned, 2),
-            "actual": round(actual, 2),
-            "remaining": round(remaining, 2),
-            "pct_used": round(pct_used, 1),
-            "daily_remaining": round(daily_remaining, 2) if days_remaining > 0 else 0,
-            "status": status,
-            "pace": pace,
-        }
 
         if insight:
             cat_data["insight"] = insight
         if planned_warning:
             cat_data["warning"] = planned_warning
 
-        if is_total:
-            overall_data = cat_data.copy()
-            overall_data.pop("tag_id", None)
-            overall_data.pop("name", None)
-        else:
-            categories.append(cat_data)
-            if not is_total:
-                overall_planned += planned
-                overall_actual += actual
+        # Children with a plan of their own; their spending is already in the parent's actual
+        subcategories = []
+        for child in entry["subcategories"]:
+            child_planned = max(child["planned"], 0)
+            child_actual = actual_by_tag.get(child["tag_id"], 0.0)
+            if child_planned == 0 and child_actual == 0:
+                continue
+            child_metrics = _budget_metrics(
+                child_planned, child_actual, days_elapsed, days_total, days_remaining
+            )
+            sub_data = {
+                "tag_id": child["tag_id"],
+                "name": child["name"],
+                "planned": child_metrics["planned"],
+            }
+            if child["breakdown"]:
+                sub_data["planned_breakdown"] = child["breakdown"]
+            sub_data.update(
+                actual=child_metrics["actual"],
+                remaining=child_metrics["remaining"],
+                pct_used=child_metrics["pct_used"],
+                status=child_metrics["status"],
+            )
+            subcategories.append(sub_data)
+        if subcategories:
+            subcategories.sort(key=sort_key, reverse=True)
+            cat_data["subcategories"] = subcategories
 
-    # Sort categories by pct_used descending (most critical first)
-    categories.sort(key=lambda x: x["pct_used"], reverse=True)
+        categories.append(cat_data)
+        overall_actual += actual
+
+    categories.sort(key=sort_key, reverse=True)
 
     result = {
         "month": f"{target_year:04d}-{target_month:02d}",
@@ -1052,38 +1618,47 @@ def check_budget_health(
         "categories": categories,
     }
 
-    # Build overall from accumulated totals (not from the "000..." total budget row
-    # which has no real transactions mapped to it)
+    # Overall: the month total when one is set, otherwise the sum of the categories.
+    # A budget for the whole month is measured against everything spent in it;
+    # a sum of category budgets only against the spending in those categories.
+    overall_plan = plan["overall"]
+    overall_planned = overall_plan["planned"]
+    if overall_plan["source"] == "category_budgets":
+        actual_scope = "budgeted_categories"
+    else:
+        overall_actual = sum(actual_by_root.values(), 0.0)
+        actual_scope = "all_spending"
+
     if overall_planned > 0 or overall_actual > 0:
-        overall_remaining = overall_planned - overall_actual
-        overall_pct_used = (overall_actual / overall_planned * 100) if overall_planned > 0 else 0
-        overall_daily_remaining = (overall_remaining / days_remaining) if days_remaining > 0 else 0
+        overall = _budget_metrics(
+            overall_planned, overall_actual, days_elapsed, days_total, days_remaining
+        )
+        overall["planned_source"] = overall_plan["source"]
+        if "breakdown" in overall_plan:
+            overall["planned_breakdown"] = overall_plan["breakdown"]
+        overall["actual_scope"] = actual_scope
+        result["overall"] = overall
 
-        if overall_pct_used < 80:
-            overall_status = "on_track"
-        elif overall_pct_used < 100:
-            overall_status = "warning"
-        else:
-            overall_status = "overspent"
-
-        month_progress = days_elapsed / days_total if days_total > 0 else 0
-        spend_progress = overall_pct_used / 100 if overall_planned > 0 else 0
-        if spend_progress > month_progress * 1.1:
-            overall_pace = "ahead_of_pace"
-        elif spend_progress < month_progress * 0.9:
-            overall_pace = "behind_pace"
-        else:
-            overall_pace = "on_pace"
-
-        result["overall"] = {
-            "planned": round(overall_planned, 2),
-            "actual": round(overall_actual, 2),
-            "remaining": round(overall_remaining, 2),
-            "pct_used": round(overall_pct_used, 1),
-            "daily_remaining": round(overall_daily_remaining, 2) if days_remaining > 0 else 0,
-            "status": overall_status,
-            "pace": overall_pace,
-        }
+    # Spending in top-level categories that have no budget at all
+    budgeted_roots = {entry["tag_id"] for entry in plan["entries"]}
+    unbudgeted = sorted(
+        (
+            {"name": root_names[root_id], "actual": round(amount, 2)}
+            for root_id, amount in actual_by_root.items()
+            if root_id not in budgeted_roots
+        ),
+        key=lambda x: x["actual"],
+        reverse=True,
+    )
+    unbudgeted_total = sum(
+        (amount for root_id, amount in actual_by_root.items() if root_id not in budgeted_roots), 0.0
+    )
+    result["unbudgeted"] = {
+        "total": round(unbudgeted_total, 2),
+        "total_categories": len(unbudgeted),
+        "returned_categories": min(len(unbudgeted), _UNBUDGETED_TOP_N),
+        "top_categories": unbudgeted[:_UNBUDGETED_TOP_N],
+    }
 
     return result
 
@@ -1095,6 +1670,7 @@ def analyze_merchants(
     top_n: int = 10,
     start_date: str | None = None,
     end_date: str | None = None,
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze spending by merchants/payees.
 
@@ -1104,15 +1680,19 @@ def analyze_merchants(
         db: Database instance.
         period: Time period ("this_month", "last_month", "last_30_days", "YYYY-MM").
         category_id: Optional category filter (includes children).
-        top_n: Number of top merchants to return.
+        top_n: Number of top merchants to return (1-100).
         start_date: Optional explicit start date (ISO). Overrides period.
         end_date: Optional explicit end date (ISO). Used with start_date.
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded".
 
     Returns:
         Dictionary with spending breakdown by merchants.
     """
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
+    top_n = _clamp_top_n(top_n)
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -1126,17 +1706,11 @@ def analyze_merchants(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
-    # Build category filter if specified
-    category_ids = []
-    if category_id:
-        category_ids.append(category_id)
-        # Add children
-        children = conn.execute(
-            "SELECT id FROM tags WHERE parent = ?", (category_id,)
-        ).fetchall()
-        category_ids.extend(row["id"] for row in children)
+    # Build category filter if specified (the category and its children)
+    category_ids = _category_scope(db, category_id)
 
-    # Query for expense transactions
+    # Query for expense transactions (off-balance accounts are filtered
+    # in Python to track what was excluded)
     query = """
         SELECT
             t.id,
@@ -1146,7 +1720,8 @@ def analyze_merchants(
             t.tag,
             t.merchant,
             t.payee,
-            m.title as merchant_title
+            m.title as merchant_title,
+            a.in_balance
         FROM transactions t
         LEFT JOIN accounts a ON a.id = t.outcome_account
         LEFT JOIN merchants m ON m.id = t.merchant
@@ -1156,7 +1731,6 @@ def analyze_merchants(
           AND NOT (t.income > 0 AND t.outcome > 0)
           AND t.outcome > 0
           AND t.income = 0
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
     """
     params: list[Any] = [start_date, end_date]
 
@@ -1164,6 +1738,7 @@ def analyze_merchants(
 
     # Aggregate by merchant
     merchant_totals: dict[str, dict[str, Any]] = {}
+    off_balance_excluded = {"amount": 0.0, "count": 0}
 
     for row in rows:
         # Filter by category if specified
@@ -1187,6 +1762,12 @@ def analyze_merchants(
         if instrument_id and instrument_id != user_currency_id:
             source_rate = db.get_instrument_rate(instrument_id)
             amount = amount * source_rate / user_rate if user_rate else amount
+
+        # Track off-balance accounts separately if not included
+        if row["in_balance"] == 0 and not include_off_balance:
+            off_balance_excluded["amount"] += amount
+            off_balance_excluded["count"] += 1
+            continue
 
         # Determine merchant key (merchant_id or payee)
         merchant_id = row["merchant"]
@@ -1230,6 +1811,7 @@ def analyze_merchants(
 
     # Sort by total amount and limit
     merchants.sort(key=lambda x: x["total"], reverse=True)
+    off_balance_excluded["amount"] = round(off_balance_excluded["amount"], 2)
 
     return {
         "period": {"start": start_date, "end": end_date},
@@ -1238,13 +1820,77 @@ def analyze_merchants(
         "merchants": merchants[:top_n],
         "returned_count": min(len(merchants), top_n),
         "total_merchants": len(merchants),
+        "off_balance_excluded": off_balance_excluded if off_balance_excluded["count"] > 0 else None,
     }
+
+
+# Payments per year for each recurring frequency
+_PAYMENTS_PER_YEAR = {"daily": 365, "weekly": 52, "biweekly": 26, "monthly": 12, "quarterly": 4, "yearly": 1}
+
+# Reminder.interval -> frequency of a reminder with step 1
+_REMINDER_FREQUENCY = {"day": "daily", "week": "weekly", "month": "monthly", "year": "yearly"}
+
+# Word stems in a category title that tell the type of a recurring payment
+_RECURRING_TYPE_STEMS = {
+    "subscription": ("подписк", "subscri", "сервис"),
+    "utility": ("жкх", "коммунал", "utilit"),
+    "loan": ("кредит", "loan"),
+    "insurance": ("страхов", "insur"),
+}
+
+
+def _recurring_type(category: str | None) -> str:
+    """Classify a recurring payment by its category title."""
+    title = (category or "").lower()
+    for payment_type, stems in _RECURRING_TYPE_STEMS.items():
+        if any(stem in title for stem in stems):
+            return payment_type
+    return "other"
+
+
+def _first_text(*candidates: str | None) -> str | None:
+    """Return the first non-blank string (stripped), or None."""
+    for candidate in candidates:
+        if candidate and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _median(values: list[float]) -> float:
+    """Return the median of a non-empty list."""
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _amounts_close(a: float, b: float, tolerance_pct: float) -> bool:
+    """Whether two amounts differ by no more than tolerance_pct of the larger one."""
+    return abs(a - b) <= max(a, b) * tolerance_pct / 100
+
+
+def _is_same_recurring_payment(reminder: dict[str, Any], pattern: dict[str, Any], tolerance_pct: float) -> bool:
+    """Whether a reminder and a pattern detected in transactions describe one payment.
+
+    They do when the payments were created from the reminder itself, or when the
+    amounts are similar and the merchant, the payee or (if one side names nobody)
+    the category is the same. Display names are never compared: many unrelated
+    payments have no payee at all.
+    """
+    if reminder["id"] in pattern["reminder_ids"]:
+        return True
+    if not _amounts_close(reminder["amount"], pattern["amount"], tolerance_pct):
+        return False
+    if reminder["merchant_id"] and reminder["merchant_id"] == pattern["merchant_id"]:
+        return True
+    if reminder["payee"] and pattern["payee"]:
+        return reminder["payee"].lower() == pattern["payee"].lower()
+    return reminder["tag_id"] == pattern["tag_id"]
 
 
 def detect_recurring(
     db: Database,
     lookback_months: int = 3,
-    tolerance_pct: int = 10,
+    tolerance_pct: float = 10,
 ) -> dict[str, Any]:
     """Detect recurring payments (subscriptions, regular bills).
 
@@ -1252,12 +1898,22 @@ def detect_recurring(
 
     Args:
         db: Database instance.
-        lookback_months: Number of months to analyze (default 3).
+        lookback_months: Number of months of history to analyze (default 3).
         tolerance_pct: Tolerance for amount variation in % (default 10).
 
     Returns:
-        Dictionary with detected recurring payments.
+        Dictionary with active recurring payments (repeating reminders plus patterns
+        detected in the history), their monthly/yearly totals in the user's currency,
+        and a short list of patterns that ended.
+
+    Raises:
+        ValueError: If lookback_months or tolerance_pct is out of range.
     """
+    if not isinstance(lookback_months, int) or not 1 <= lookback_months <= 120:
+        raise ValueError(f"lookback_months must be a whole number from 1 to 120, got {lookback_months!r}")
+    if not isinstance(tolerance_pct, (int, float)) or tolerance_pct < 0:
+        raise ValueError(f"tolerance_pct must be a non-negative number, got {tolerance_pct!r}")
+
     conn = db.connect()
 
     # Get user currency
@@ -1276,23 +1932,30 @@ def detect_recurring(
     today = date.today()
     start_date = today - timedelta(days=lookback_months * 30)
 
-    # Query expense transactions
+    # Query expense transactions on every account: a subscription paid from an
+    # off-balance account is still a subscription
     rows = conn.execute("""
         SELECT
             t.id, t.date, t.outcome, t.outcome_instrument, t.outcome_account,
-            t.merchant, t.payee, t.tag, t.mcc,
+            t.merchant, t.payee, t.comment,
+            json_extract(t.tag, '$[0]') as tag_id,
             m.title as merchant_title,
-            a.title as account_title
+            tag.title as tag_title,
+            a.title as account_title,
+            i.short_title as currency, i.rate,
+            rm.reminder as reminder_id
         FROM transactions t
         LEFT JOIN merchants m ON m.id = t.merchant
+        LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
         LEFT JOIN accounts a ON a.id = t.outcome_account
+        LEFT JOIN instruments i ON i.id = t.outcome_instrument
+        LEFT JOIN reminder_markers rm ON rm.id = t.reminder_marker
         WHERE t.deleted = 0
           AND (t.hold IS NULL OR t.hold = 0)
           AND NOT (t.income > 0 AND t.outcome > 0)
           AND t.outcome > 0
           AND t.income = 0
           AND t.date >= ?
-          AND (a.in_balance = 1 OR a.in_balance IS NULL)
         ORDER BY t.date ASC
     """, (start_date.isoformat(),)).fetchall()
 
@@ -1301,25 +1964,14 @@ def detect_recurring(
     for row in rows:
         # Convert to user currency
         amount = row["outcome"]
-        instrument_id = row["outcome_instrument"]
-        if instrument_id and instrument_id != user_currency_id:
-            source_rate = db.get_instrument_rate(instrument_id)
-            converted_amount = amount * source_rate / user_rate if user_rate else amount
+        if row["rate"] and user_rate and row["outcome_instrument"] != user_currency_id:
+            converted_amount = amount * row["rate"] / user_rate
         else:
             converted_amount = amount
 
-        # Group key
-        payee_key = row["merchant_title"] or row["payee"] or "unknown"
-        tag_json = row["tag"]
-        if tag_json:
-            try:
-                tags = json.loads(tag_json)
-                tag_key = tags[0] if tags else None
-            except (json.JSONDecodeError, IndexError):
-                tag_key = None
-        else:
-            tag_key = None
-
+        # Group key (payee_key is None for payments without a payee)
+        payee_key = _first_text(row["merchant_title"], row["payee"])
+        tag_key = row["tag_id"]
         account_key = row["outcome_account"]
 
         # Round amount to nearest 100 for grouping (tolerance for minor variations)
@@ -1332,20 +1984,30 @@ def detect_recurring(
                 "payee": payee_key,
                 "merchant_id": row["merchant"],
                 "tag": tag_key,
+                "tag_title": row["tag_title"],
                 "account": account_key,
                 "account_title": row["account_title"],
-                "mcc": row["mcc"],
+                "comment": None,
+                "reminder_ids": set(),
                 "transactions": [],
             }
+
+        # Rows come oldest first, so the latest comment wins
+        groups[group_key]["comment"] = _first_text(row["comment"]) or groups[group_key]["comment"]
+        if row["reminder_id"]:
+            groups[group_key]["reminder_ids"].add(row["reminder_id"])
 
         groups[group_key]["transactions"].append({
             "id": row["id"],
             "date": row["date"],
             "amount": converted_amount,
+            "original_amount": amount,
+            "currency": row["currency"] or currency_code,
         })
 
     # Analyze each group for recurring patterns
-    recurring = []
+    detected = []
+    ended = []
 
     for group_key, group_data in groups.items():
         txs = group_data["transactions"]
@@ -1368,90 +2030,79 @@ def detect_recurring(
         if not intervals:
             continue
 
-        # Determine average interval
-        avg_interval = sum(intervals) / len(intervals)
+        # Determine the typical interval (a median survives a skipped or a doubled payment)
+        typical_interval = _median(intervals)
 
         # Classify frequency
-        if 25 <= avg_interval <= 35:
+        if 25 <= typical_interval <= 35:
             frequency = "monthly"
             interval_days = 30
-        elif 6 <= avg_interval <= 8:
+        elif 6 <= typical_interval <= 8:
             frequency = "weekly"
             interval_days = 7
-        elif 12 <= avg_interval <= 16:
+        elif 12 <= typical_interval <= 16:
             frequency = "biweekly"
             interval_days = 14
-        elif 85 <= avg_interval <= 95:
+        elif 85 <= typical_interval <= 95:
             frequency = "quarterly"
             interval_days = 90
-        elif 360 <= avg_interval <= 370:
+        elif 360 <= typical_interval <= 370:
             frequency = "yearly"
             interval_days = 365
         else:
             # Not a clear pattern
             continue
 
-        # Check amount stability
+        # Check amount stability from one payment to the next: comparing the extremes
+        # of a long window would reject a price that drifts slowly (currency rates)
         amounts = [tx["amount"] for tx in txs]
         avg_amount = sum(amounts) / len(amounts)
-        max_amount = max(amounts)
-        min_amount = min(amounts)
-
-        if avg_amount > 0:
-            variation_pct = ((max_amount - min_amount) / avg_amount) * 100
-        else:
-            variation_pct = 0
 
         # Skip if amounts vary too much
-        if variation_pct > tolerance_pct:
+        if not all(_amounts_close(a, b, tolerance_pct) for a, b in zip(amounts, amounts[1:])):
             continue
 
-        # Check consistency (at least 2 occurrences expected within lookback period)
-        expected_occurrences = (lookback_months * 30) / interval_days
+        # Check regularity over the pattern's own span (first to last payment), not the
+        # whole lookback window: a subscription that started mid-window is still regular.
+        # The span is divided by the typical interval: calendar months are not 30 days
+        first_payment_date = date.fromisoformat(txs[0]["date"])
+        last_payment_date = date.fromisoformat(txs[-1]["date"])
+        expected_occurrences = round((last_payment_date - first_payment_date).days / typical_interval) + 1
         actual_occurrences = len(txs)
-        confidence = min(actual_occurrences / max(expected_occurrences, 1), 1.0)
+        regularity = min(actual_occurrences / expected_occurrences, 1.0)
+
+        # Two payments are weak evidence, and for intervals shorter than a month no
+        # evidence at all (two same-priced purchases a week apart are common)
+        if actual_occurrences < 3 and interval_days < 30:
+            continue
+        confidence = regularity * min(actual_occurrences / 3, 1.0)
 
         # Skip if confidence too low
         if confidence < 0.5:
             continue
 
-        # Get tag name
-        tag_name = None
-        if group_data["tag"]:
-            tag_row = conn.execute(
-                "SELECT title FROM tags WHERE id = ?", (group_data["tag"],)
-            ).fetchone()
-            if tag_row:
-                tag_name = tag_row["title"]
-
-        # Classify type based on MCC and tag
-        mcc = group_data["mcc"]
-        if tag_name:
-            tag_lower = tag_name.lower()
-            if any(word in tag_lower for word in ["подписка", "subscription", "сервис"]):
-                payment_type = "subscription"
-            elif any(word in tag_lower for word in ["жкх", "коммунал", "utility"]):
-                payment_type = "utility"
-            elif any(word in tag_lower for word in ["кредит", "loan"]):
-                payment_type = "loan"
-            elif any(word in tag_lower for word in ["страхов", "insurance"]):
-                payment_type = "insurance"
-            else:
-                payment_type = "other"
-        else:
-            payment_type = "other"
+        tag_name = group_data["tag_title"]
 
         # Calculate next expected payment
-        last_payment_date = date.fromisoformat(txs[-1]["date"])
         next_expected = last_payment_date + timedelta(days=int(interval_days))
 
         # Calculate yearly cost
-        yearly_cost = avg_amount * (365 / interval_days)
+        yearly_cost = avg_amount * _PAYMENTS_PER_YEAR[frequency]
 
-        recurring.append({
-            "name": group_data["payee"],
+        # Original amount, when every payment was made in the same currency
+        if len({tx["currency"] for tx in txs}) == 1:
+            original_amount = sum(tx["original_amount"] for tx in txs) / len(txs)
+            original_currency = txs[0]["currency"]
+        else:
+            original_amount = avg_amount
+            original_currency = currency_code
+
+        item = {
+            "name": group_data["payee"] or group_data["comment"] or tag_name or "Unknown",
             "merchant_id": group_data["merchant_id"],
             "avg_amount": round(avg_amount, 2),
+            "original_amount": round(original_amount, 2),
+            "original_currency": original_currency,
             "frequency": frequency,
             "interval_days": interval_days,
             "category": tag_name,
@@ -1460,65 +2111,107 @@ def detect_recurring(
             "next_expected": next_expected.isoformat() if next_expected <= today + timedelta(days=60) else None,
             "confidence": round(confidence, 2),
             "source": "detected",
-            "type": payment_type,
+            "type": _recurring_type(tag_name),
             "occurrences": actual_occurrences,
             "yearly_cost": round(yearly_cost, 2),
-        })
+        }
 
-    # Build set of detected names for dedup
-    detected_names = {r["name"].strip().lower() for r in recurring if r.get("name")}
-
-    # Add reminders with interval != null
-    reminder_rows = conn.execute("""
-        SELECT r.id, r.interval, r.step, r.outcome, r.payee, r.tag,
-               r.outcome_account, t.title as tag_title, a.title as account_title
-        FROM reminders r
-        LEFT JOIN tags t ON t.id = json_extract(r.tag, '$[0]')
-        LEFT JOIN accounts a ON a.id = r.outcome_account
-        WHERE r.interval IS NOT NULL AND r.outcome > 0
-    """).fetchall()
-
-    for row in reminder_rows:
-        # Skip if already detected from transactions
-        reminder_name = (row["payee"] or "Unknown").strip().lower()
-        if reminder_name in detected_names:
+        # A pattern whose last payment is older than 1.5 intervals is no longer active
+        if (today - last_payment_date).days > 1.5 * interval_days:
+            ended.append({
+                key: item[key]
+                for key in (
+                    "name", "avg_amount", "original_amount", "original_currency",
+                    "frequency", "category", "account", "last_payment", "occurrences",
+                )
+            })
             continue
 
-        frequency_map = {
-            "day": "daily",
-            "week": "weekly",
-            "month": "monthly",
-            "year": "yearly",
-        }
-        frequency = frequency_map.get(row["interval"], row["interval"])
+        detected.append({
+            "item": item,
+            "amount": avg_amount,
+            "merchant_id": group_data["merchant_id"],
+            "payee": group_data["payee"],
+            "tag_id": group_data["tag"],
+            "reminder_ids": group_data["reminder_ids"],
+        })
 
-        # Compute yearly_cost from amount and frequency
-        interval_days_map = {
-            "daily": 1,
-            "weekly": 7,
-            "month": 30,
-            "monthly": 30,
-            "year": 365,
-            "yearly": 365,
-        }
-        interval_d = interval_days_map.get(frequency, 30)
-        yearly_cost = row["outcome"] * (365 / interval_d)
+    # Add repeating reminders that are still in force (transfers between accounts are
+    # not payments). A reminder has no instrument of its own: its amount is in the
+    # currency of its account.
+    reminder_rows = conn.execute("""
+        SELECT r.id, r.interval, r.step, r.outcome, r.payee, r.comment, r.merchant,
+               json_extract(r.tag, '$[0]') as tag_id,
+               r.outcome_account, t.title as tag_title, a.title as account_title,
+               m.title as merchant_title,
+               i.short_title as currency, i.rate
+        FROM reminders r
+        LEFT JOIN tags t ON t.id = json_extract(r.tag, '$[0]')
+        LEFT JOIN merchants m ON m.id = r.merchant
+        LEFT JOIN accounts a ON a.id = r.outcome_account
+        LEFT JOIN instruments i ON i.id = a.instrument
+        WHERE r.interval IN ('day', 'week', 'month', 'year')
+          AND r.outcome > 0
+          AND (r.income IS NULL OR r.income = 0)
+          AND (r.end_date IS NULL OR r.end_date >= ?)
+    """, (today.isoformat(),)).fetchall()
 
-        recurring.append({
-            "name": row["payee"] or "Unknown",
-            "merchant_id": None,
-            "avg_amount": round(row["outcome"], 2),
+    recurring = []
+    for row in reminder_rows:
+        # Convert to user currency
+        if row["rate"] and user_rate:
+            amount = row["outcome"] * row["rate"] / user_rate
+        else:
+            amount = row["outcome"]
+
+        # A reminder repeats every `step` intervals
+        step = row["step"] or 1
+        base_frequency = _REMINDER_FREQUENCY[row["interval"]]
+        frequency = base_frequency if step == 1 else f"every {step} {row['interval']}s"
+        yearly_cost = amount * _PAYMENTS_PER_YEAR[base_frequency] / step
+
+        payee = _first_text(row["merchant_title"], row["payee"])
+        item = {
+            "name": payee or _first_text(row["comment"], row["tag_title"]) or "Unknown",
+            "merchant_id": row["merchant"],
+            "avg_amount": round(amount, 2),
+            "original_amount": round(row["outcome"], 2),
+            "original_currency": row["currency"] or currency_code,
             "frequency": frequency,
             "category": row["tag_title"],
             "account": row["account_title"],
             "confidence": 1.0,
             "source": "reminder",
-            "type": "other",
+            "type": _recurring_type(row["tag_title"]),
             "yearly_cost": round(yearly_cost, 2),
-        })
+        }
+
+        # The reminder replaces the patterns its own payments left in the history
+        reminder = {
+            "id": row["id"],
+            "amount": amount,
+            "merchant_id": row["merchant"],
+            "payee": payee,
+            "tag_id": row["tag_id"],
+        }
+        matches, others = [], []
+        for pattern in detected:
+            same = _is_same_recurring_payment(reminder, pattern, tolerance_pct)
+            (matches if same else others).append(pattern)
+        if matches:
+            detected = others
+            item["last_payment"] = max(p["item"]["last_payment"] for p in matches)
+            item["occurrences"] = sum(p["item"]["occurrences"] for p in matches)
+
+        recurring.append(item)
+
+    recurring.extend(p["item"] for p in detected)
 
     # Sort by yearly cost descending
     recurring.sort(key=lambda x: x.get("yearly_cost", 0), reverse=True)
+
+    # Most recently ended first
+    ended.sort(key=lambda x: x["last_payment"], reverse=True)
 
     # Calculate totals
     total_monthly = sum(r.get("yearly_cost", 0) / 12 for r in recurring)
@@ -1530,6 +2223,8 @@ def detect_recurring(
         "currency": currency_code,
         "recurring": recurring,
         "total_found": len(recurring),
+        "ended": ended[:10],
+        "ended_count": len(ended),
     }
 
 
@@ -1538,6 +2233,7 @@ def analyze_trends(
     months: int = 6,
     category_id: str | None = None,
     metric: str = "outcome",
+    include_off_balance: bool = False,
 ) -> dict[str, Any]:
     """Analyze spending/income trends over time.
 
@@ -1545,14 +2241,26 @@ def analyze_trends(
 
     Args:
         db: Database instance.
-        months: Number of months to analyze (default 6).
+        months: Number of months to analyze, the current one included (default 6).
+            Months before the first transaction are omitted.
         category_id: Optional category filter.
         metric: Metric to track ("outcome", "income", "savings_rate", "net_cashflow").
+        include_off_balance: Include off-balance accounts. They are left out by
+            default, as in ZenMoney's own reports; the amount left out is reported
+            in "off_balance_excluded" (split into "outcome" and "income" for
+            "savings_rate" and "net_cashflow").
 
     Returns:
-        Dictionary with monthly data and trend analysis.
+        Dictionary with monthly data and trend analysis. The statistics cover
+        complete months with a defined value; with fewer than 2 of them the
+        summary holds a single month's value and a note instead.
     """
     conn = db.connect()
+    months = _count_arg(months, "months")
+    if metric not in ("outcome", "income", "savings_rate", "net_cashflow"):
+        raise ValueError(
+            f"Unknown metric {metric!r}. Use 'outcome', 'income', 'savings_rate' or 'net_cashflow'."
+        )
 
     # Get user currency
     user_currency_id = db.get_user_currency()
@@ -1566,14 +2274,36 @@ def analyze_trends(
     currency_code = currency_row["short_title"] if currency_row else "RUB"
     user_rate = currency_row["rate"] if currency_row else 1.0
 
+    # Build category filter if specified (the category and its children)
+    category_ids = _category_scope(db, category_id)
+
     # Calculate month range
     today = date.today()
     current_month_start = today.replace(day=1)
 
-    monthly_data = []
-    values = []
+    # Months before the first transaction hold no data. Shown as zeros they would
+    # drag the statistics down, so the series starts where the history starts
+    first_date = conn.execute(
+        "SELECT MIN(date) AS first_date FROM transactions WHERE deleted = 0"
+    ).fetchone()["first_date"]
+    history_months = 0
+    if first_date:
+        history_start = parse_iso_date(first_date, "transaction date")
+        history_months = (
+            (today.year - history_start.year) * 12 + today.month - history_start.month + 1
+        )
+    months_shown = max(0, min(months, history_months))
 
-    for i in range(months - 1, -1, -1):
+    monthly_data = []
+    # Complete months with a defined value: the basis of the statistics
+    values = []
+    value_months = []
+    value_positions = []
+    complete_months = 0
+    off_balance_outcome = {"amount": 0.0, "count": 0}
+    off_balance_income = {"amount": 0.0, "count": 0}
+
+    for i in range(months_shown - 1, -1, -1):
         # Calculate month start
         month_offset = i
         if current_month_start.month > month_offset:
@@ -1594,18 +2324,10 @@ def analyze_trends(
         month_key = month_start.strftime("%Y-%m")
         is_partial = (month_start.year == today.year and month_start.month == today.month)
 
-        # Build category filter
-        category_ids = []
-        if category_id:
-            category_ids.append(category_id)
-            children = conn.execute(
-                "SELECT id FROM tags WHERE parent = ?", (category_id,)
-            ).fetchall()
-            category_ids.extend(row["id"] for row in children)
-
-        # Calculate outcome for this month
+        # Calculate outcome for this month (off-balance accounts are filtered
+        # in Python to track what was excluded)
         outcome_query = """
-            SELECT t.outcome, t.outcome_instrument
+            SELECT t.outcome, t.outcome_instrument, a.in_balance
             FROM transactions t
             LEFT JOIN accounts a ON a.id = t.outcome_account
             WHERE t.deleted = 0
@@ -1614,7 +2336,6 @@ def analyze_trends(
               AND t.outcome > 0
               AND t.income = 0
               AND t.date >= ? AND t.date <= ?
-              AND (a.in_balance = 1 OR a.in_balance IS NULL)
         """
         outcome_params: list[Any] = [month_start.isoformat(), month_end.isoformat()]
 
@@ -1631,12 +2352,16 @@ def analyze_trends(
             if instrument_id and instrument_id != user_currency_id:
                 source_rate = db.get_instrument_rate(instrument_id)
                 amount = amount * source_rate / user_rate if user_rate else amount
+            if row["in_balance"] == 0 and not include_off_balance:
+                off_balance_outcome["amount"] += amount
+                off_balance_outcome["count"] += 1
+                continue
             total_outcome += amount
 
         # Calculate income for this month (if needed for metric)
         if metric in ("income", "savings_rate", "net_cashflow"):
             income_query = """
-                SELECT t.income, t.income_instrument
+                SELECT t.income, t.income_instrument, a.in_balance
                 FROM transactions t
                 LEFT JOIN accounts a ON a.id = t.income_account
                 WHERE t.deleted = 0
@@ -1644,7 +2369,6 @@ def analyze_trends(
                   AND t.income > 0
                   AND t.outcome = 0
                   AND t.date >= ? AND t.date <= ?
-                  AND (a.in_balance = 1 OR a.in_balance IS NULL)
             """
             income_params: list[Any] = [month_start.isoformat(), month_end.isoformat()]
 
@@ -1661,6 +2385,10 @@ def analyze_trends(
                 if instrument_id and instrument_id != user_currency_id:
                     source_rate = db.get_instrument_rate(instrument_id)
                     amount = amount * source_rate / user_rate if user_rate else amount
+                if row["in_balance"] == 0 and not include_off_balance:
+                    off_balance_income["amount"] += amount
+                    off_balance_income["count"] += 1
+                    continue
                 total_income += amount
         else:
             total_income = 0.0
@@ -1671,61 +2399,59 @@ def analyze_trends(
         elif metric == "income":
             value = total_income
         elif metric == "savings_rate":
-            value = ((total_income - total_outcome) / total_income * 100) if total_income > 0 else 0
-        elif metric == "net_cashflow":
+            # Undefined without income: 0 % would claim that nothing was overspent
+            value = ((total_income - total_outcome) / total_income * 100) if total_income > 0 else None
+        else:  # net_cashflow
             value = total_income - total_outcome
-        else:
-            value = total_outcome
 
         month_data = {
             "month": month_key,
-            "value": round(value, 2),
+            "value": round(value, 2) if value is not None else None,
         }
         if is_partial:
             month_data["partial"] = True
 
         monthly_data.append(month_data)
         if not is_partial:  # Don't include partial month in trend calculation
-            values.append(value)
+            if value is not None:
+                values.append(value)
+                value_months.append(month_key)
+                value_positions.append(complete_months)
+            complete_months += 1
 
     # Calculate statistics
-    if values:
+    if len(values) >= 2:
         avg_value = sum(values) / len(values)
         min_value = min(values)
         max_value = max(values)
 
-        # Find min/max months
-        min_month = next((m for m in monthly_data if m["value"] == min_value), None)
-        max_month = next((m for m in monthly_data if m["value"] == max_value), None)
+        # Find min/max months (the values are unrounded, so look them up by position)
+        min_month = value_months[values.index(min_value)]
+        max_month = value_months[values.index(max_value)]
 
         # Calculate trend direction (simple linear regression slope)
-        if len(values) >= 2:
-            n = len(values)
-            x_values = list(range(n))
-            x_mean = sum(x_values) / n
-            y_mean = avg_value
+        n = len(values)
+        x_values = value_positions  # month positions, so a skipped month keeps its gap
+        x_mean = sum(x_values) / n
+        y_mean = avg_value
 
-            numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, values))
-            denominator = sum((x - x_mean) ** 2 for x in x_values)
+        numerator = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, values))
+        denominator = sum((x - x_mean) ** 2 for x in x_values)
+        slope = numerator / denominator
 
-            if denominator != 0:
-                slope = numerator / denominator
-                pct_change_per_month = (slope / y_mean * 100) if y_mean != 0 else 0
-
-                if abs(pct_change_per_month) < 2:
-                    trend_direction = "stable"
-                elif pct_change_per_month > 0:
-                    trend_direction = "rising"
-                else:
-                    trend_direction = "falling"
-            else:
-                slope = 0
-                pct_change_per_month = 0
-                trend_direction = "stable"
+        # Relative to the size of the average: a negative average must not flip
+        # the sign, and around a zero average a percentage is undefined
+        if round(y_mean, 2) != 0:
+            pct_change_per_month = slope / abs(y_mean) * 100
         else:
-            slope = 0
-            pct_change_per_month = 0
+            pct_change_per_month = None
+
+        if slope == 0 or (pct_change_per_month is not None and abs(pct_change_per_month) < 2):
             trend_direction = "stable"
+        elif slope > 0:
+            trend_direction = "rising"
+        else:
+            trend_direction = "falling"
 
         # Detect anomalies (values > 2 standard deviations from mean)
         if len(values) >= 3:
@@ -1734,33 +2460,47 @@ def analyze_trends(
 
             anomalies = []
             for month_data in monthly_data:
-                if month_data.get("partial"):
+                if month_data.get("partial") or month_data["value"] is None:
                     continue
                 value = month_data["value"]
                 if abs(value - avg_value) > 2 * stddev:
-                    deviation_pct = ((value - avg_value) / avg_value * 100) if avg_value != 0 else 0
+                    if round(avg_value, 2) != 0:
+                        deviation = f"{(value - avg_value) / abs(avg_value) * 100:+.1f}%"
+                    else:
+                        deviation = None
                     anomalies.append({
                         "month": month_data["month"],
                         "value": value,
-                        "deviation": f"{deviation_pct:+.1f}%",
+                        "deviation": deviation,
                     })
         else:
             anomalies = []
 
         summary = {
             "average": round(avg_value, 2),
-            "min": {"month": min_month["month"] if min_month else None, "value": round(min_value, 2)},
-            "max": {"month": max_month["month"] if max_month else None, "value": round(max_value, 2)},
+            "min": {"month": min_month, "value": round(min_value, 2)},
+            "max": {"month": max_month, "value": round(max_value, 2)},
             "trend_direction": trend_direction,
-            "trend_pct_change_per_month": round(pct_change_per_month, 1),
+            "trend_pct_change_per_month": (
+                round(pct_change_per_month, 1) if pct_change_per_month is not None else None
+            ),
         }
 
         if anomalies:
             summary["anomalies"] = anomalies
     else:
-        summary = {
-            "message": "Insufficient data for analysis"
-        }
+        # A single month is no trend: report its value (a complete month if there is one)
+        defined = [m for m in monthly_data if m["value"] is not None]
+        complete = [m for m in defined if not m.get("partial")]
+        if defined:
+            summary = {
+                **(complete or defined)[-1],
+                "note": "A trend needs at least 2 complete months of data",
+            }
+        else:
+            summary = {
+                "message": "Insufficient data for analysis"
+            }
 
     # Get category name if specified
     category_name = None
@@ -1769,13 +2509,38 @@ def analyze_trends(
         if cat_row:
             category_name = cat_row["title"]
 
-    return {
+    # What the off-balance filter left out, for the sides the metric is built from
+    off_balance_outcome["amount"] = round(off_balance_outcome["amount"], 2)
+    off_balance_income["amount"] = round(off_balance_income["amount"], 2)
+    if metric == "income":
+        off_balance_excluded = off_balance_income if off_balance_income["count"] > 0 else None
+    elif metric in ("savings_rate", "net_cashflow"):
+        if off_balance_outcome["count"] > 0 or off_balance_income["count"] > 0:
+            off_balance_excluded = {"outcome": off_balance_outcome, "income": off_balance_income}
+        else:
+            off_balance_excluded = None
+    else:
+        off_balance_excluded = off_balance_outcome if off_balance_outcome["count"] > 0 else None
+
+    result = {
         "metric": metric,
         "category": category_name,
         "currency": currency_code if metric in ("outcome", "income", "net_cashflow") else None,
         "data": monthly_data,
         "summary": summary,
+        "off_balance_excluded": off_balance_excluded,
     }
+    if first_date and months_shown < months:
+        result["note"] = (
+            f"No transactions before {history_start:%Y-%m}: "
+            f"{months - months_shown} of the {months} requested months are omitted"
+        )
+
+    return result
+
+
+# How far back a still-planned reminder marker is reported as overdue
+_OVERDUE_LOOKBACK_DAYS = 30
 
 
 def get_upcoming_payments(
@@ -1791,8 +2556,17 @@ def get_upcoming_payments(
         days_ahead: Planning horizon in days (default 30).
 
     Returns:
-        Dictionary with upcoming payments and weekly/monthly load.
+        Dictionary with upcoming payments and incomes, planned transfers between
+        accounts (listed apart, never counted as spending), overdue items (still
+        planned although their date passed within the last 30 days) and weekly load.
+        Amounts are in the user's currency; each item keeps its original amount.
+
+    Raises:
+        ValueError: If days_ahead is out of range.
     """
+    if not isinstance(days_ahead, int) or not 0 <= days_ahead <= 3650:
+        raise ValueError(f"days_ahead must be a whole number from 0 to 3650, got {days_ahead!r}")
+
     conn = db.connect()
 
     # Get user currency
@@ -1810,8 +2584,9 @@ def get_upcoming_payments(
     # Calculate date range
     today = date.today()
     end_date = (today + timedelta(days=days_ahead)).isoformat()
+    overdue_from = (today - timedelta(days=_OVERDUE_LOOKBACK_DAYS)).isoformat()
 
-    # Query upcoming reminder markers
+    # Query planned reminder markers: upcoming ones and those that are overdue
     rows = conn.execute("""
         SELECT
             rm.id,
@@ -1827,74 +2602,112 @@ def get_upcoming_payments(
             rm.reminder,
             ia.title as income_account_title,
             oa.title as outcome_account_title,
-            oa.instrument as outcome_instrument,
-            ia.instrument as income_instrument,
+            oi.short_title as outcome_currency,
+            oi.rate as outcome_rate,
+            ii.short_title as income_currency,
+            ii.rate as income_rate,
             t.title as tag_title,
             m.title as merchant_title
         FROM reminder_markers rm
         LEFT JOIN accounts ia ON ia.id = rm.income_account
         LEFT JOIN accounts oa ON oa.id = rm.outcome_account
+        LEFT JOIN instruments ii ON ii.id = ia.instrument
+        LEFT JOIN instruments oi ON oi.id = oa.instrument
         LEFT JOIN tags t ON t.id = json_extract(rm.tag, '$[0]')
         LEFT JOIN merchants m ON m.id = rm.merchant
         WHERE rm.state = 'planned'
           AND rm.date >= ?
           AND rm.date <= ?
         ORDER BY rm.date ASC
-    """, (today.isoformat(), end_date)).fetchall()
+    """, (overdue_from, end_date)).fetchall()
 
     upcoming = []
+    transfers = []
+    overdue = []
     total_income = 0.0
     total_outcome = 0.0
+    total_transfers = 0.0
+    total_overdue_income = 0.0
+    total_overdue_outcome = 0.0
 
     for row in rows:
         income = row["income"] or 0
         outcome = row["outcome"] or 0
 
-        # Determine type and convert amount
-        if outcome > 0:
+        # Determine type; a marker's amount is in the currency of its account
+        if outcome > 0 and income > 0:
+            tx_type = "transfer"  # between own accounts: not a payment
+        elif outcome > 0:
             tx_type = "outcome"
-            amount = outcome
-            instrument_id = row["outcome_instrument"]
-            account = row["outcome_account_title"]
         elif income > 0:
             tx_type = "income"
-            amount = income
-            instrument_id = row["income_instrument"]
-            account = row["income_account_title"]
         else:
             continue  # Skip zero-amount markers
 
+        if tx_type == "income":
+            amount = income
+            rate = row["income_rate"]
+            original_currency = row["income_currency"]
+            account = row["income_account_title"]
+        else:
+            amount = outcome
+            rate = row["outcome_rate"]
+            original_currency = row["outcome_currency"]
+            account = row["outcome_account_title"]
+
         # Convert to user currency
-        if instrument_id and instrument_id != user_currency_id:
-            source_rate = db.get_instrument_rate(instrument_id)
-            converted_amount = amount * source_rate / user_rate if user_rate else amount
-        else:
-            converted_amount = amount
+        converted_amount = amount * rate / user_rate if rate and user_rate else amount
 
-        # Aggregate totals
-        if tx_type == "outcome":
-            total_outcome += converted_amount
-        else:
-            total_income += converted_amount
-
-        # Get category name
-        category = row["tag_title"]
-
-        # Get payee/merchant
-        payee = row["merchant_title"] or row["payee"] or "Unknown"
-
-        upcoming.append({
+        item = {
             "id": row["id"],
             "date": row["date"],
             "type": tx_type,
             "amount": round(converted_amount, 2),
             "currency": currency_code,
-            "account": account,
-            "category": category,
-            "payee": payee,
+            "original_amount": round(amount, 2),
+            "original_currency": original_currency or currency_code,
+        }
+
+        if tx_type == "transfer":
+            item.update({
+                "from_account": account,
+                "to_account": row["income_account_title"],
+                "received_amount": round(income, 2),
+                "received_currency": row["income_currency"] or currency_code,
+            })
+        else:
+            item.update({
+                "account": account,
+                "category": row["tag_title"],
+                "payee": _first_text(
+                    row["merchant_title"], row["payee"], row["comment"], row["tag_title"]
+                ) or "Unknown",
+            })
+        item.update({
             "comment": row["comment"],
             "reminder_id": row["reminder"],
         })
+
+        # A marker still planned after its date was neither paid nor cancelled
+        if row["date"] < today.isoformat():
+            item["days_overdue"] = (today - date.fromisoformat(row["date"])).days
+            overdue.append(item)
+            if tx_type == "outcome":
+                total_overdue_outcome += converted_amount
+            elif tx_type == "income":
+                total_overdue_income += converted_amount
+            continue
+
+        # Aggregate totals (transfers are kept out of income and outcome)
+        if tx_type == "transfer":
+            transfers.append(item)
+            total_transfers += converted_amount
+        elif tx_type == "outcome":
+            upcoming.append(item)
+            total_outcome += converted_amount
+        else:
+            upcoming.append(item)
+            total_income += converted_amount
 
     # Calculate weekly load
     weekly_load = []
@@ -1924,13 +2737,22 @@ def get_upcoming_payments(
 
     return {
         "upcoming": upcoming,
+        "upcoming_count": len(upcoming),
         "total_upcoming_outcome": round(total_outcome, 2),
         "total_upcoming_income": round(total_income, 2),
+        "transfers": transfers,
+        "transfers_count": len(transfers),
+        "total_transfers": round(total_transfers, 2),
+        "overdue": overdue,
+        "overdue_count": len(overdue),
+        "total_overdue_outcome": round(total_overdue_outcome, 2),
+        "total_overdue_income": round(total_overdue_income, 2),
         "currency": currency_code,
         "period": {
             "start": today.isoformat(),
             "end": end_date,
             "days": days_ahead,
+            "overdue_from": overdue_from,
         },
         "weekly_load": weekly_load,
     }
@@ -1941,10 +2763,24 @@ def get_debts(db: Database) -> dict[str, Any]:
 
     T11: "Who owes me?", "Who do I owe?", "Debt summary"
 
+    All amounts are in the user's currency. Each operation is labelled from the
+    user's point of view: money given is "you_lent", or "you_repaid" if it reduces
+    what the user owed; money received is "you_borrowed", or "they_repaid" if it
+    reduces what the person owed.
+
     Returns:
         Dictionary with debts breakdown by counterparty.
     """
     conn = db.connect()
+
+    # Get user currency
+    user_currency_id = db.get_user_currency()
+    currency_row = conn.execute(
+        "SELECT short_title, rate FROM instruments WHERE id = ?",
+        (user_currency_id,)
+    ).fetchone()
+    currency_code = currency_row["short_title"] if currency_row else "RUB"
+    user_rate = currency_row["rate"] if currency_row else None
 
     # Find debt accounts
     debt_accounts = conn.execute(
@@ -1953,7 +2789,7 @@ def get_debts(db: Database) -> dict[str, Any]:
 
     if not debt_accounts:
         return {
-            "currency": "RUB",
+            "currency": currency_code,
             "summary": {
                 "total_owed_to_you": 0.0,
                 "total_you_owe": 0.0,
@@ -1962,31 +2798,28 @@ def get_debts(db: Database) -> dict[str, Any]:
             "by_counterparty": [],
         }
 
-    # Get user currency
-    user_currency_id = db.get_user_currency()
-    currency_row = conn.execute(
-        "SELECT short_title FROM instruments WHERE id = ?",
-        (user_currency_id,)
-    ).fetchone()
-    currency_code = currency_row["short_title"] if currency_row else "RUB"
-
     counterparties_data = {}
 
     for debt_acc in debt_accounts:
         account_id = debt_acc["id"]
-        account_balance = debt_acc["balance"] or 0
 
-        # Get all transactions for this debt account
+        # Get all transactions for this debt account, oldest first: the label of
+        # an operation depends on the balance before it. A debt operation is
+        # recorded in the currency of the non-debt account, on both sides.
         rows = conn.execute("""
             SELECT t.id, t.date, t.income, t.outcome,
                    t.income_account, t.outcome_account,
                    t.merchant, t.payee, t.comment,
-                   m.title as merchant_title
+                   m.title as merchant_title,
+                   ii.short_title as income_currency, ii.rate as income_rate,
+                   oi.short_title as outcome_currency, oi.rate as outcome_rate
             FROM transactions t
             LEFT JOIN merchants m ON m.id = t.merchant
+            LEFT JOIN instruments ii ON ii.id = t.income_instrument
+            LEFT JOIN instruments oi ON oi.id = t.outcome_instrument
             WHERE t.deleted = 0
               AND (t.income_account = ? OR t.outcome_account = ?)
-            ORDER BY t.date DESC
+            ORDER BY t.date, t.created
         """, (account_id, account_id)).fetchall()
 
         for row in rows:
@@ -2002,30 +2835,58 @@ def get_debts(db: Database) -> dict[str, Any]:
                     "balance": 0.0,
                     "history": [],
                 }
+            elif row["merchant"]:
+                counterparties_data[counterparty]["merchant_id"] = row["merchant"]
 
-            # Determine transaction type and update balance
-            if row["income_account"] == account_id:
-                # Money came into debt account (I lent money or they returned)
-                amount = row["income"]
-                tx_type = "lent" if row["outcome"] > 0 else "received"
-                counterparties_data[counterparty]["balance"] += amount
+            # Both sides of a debt operation are > 0; the direction is given by
+            # which side is the debt account.
+            given = row["income_account"] == account_id
+            if given:
+                # Money came into debt account (I lent money or I returned)
+                original_amount = row["income"]
+                original_currency = row["income_currency"]
+                rate = row["income_rate"]
             else:
-                # Money went out from debt account (They lent me or I returned)
-                amount = row["outcome"]
-                tx_type = "borrowed" if row["income"] > 0 else "returned"
-                counterparties_data[counterparty]["balance"] -= amount
+                # Money went out from debt account (They lent me or they returned)
+                original_amount = row["outcome"]
+                original_currency = row["outcome_currency"]
+                rate = row["outcome_rate"]
 
-            counterparties_data[counterparty]["history"].append({
+            # Convert to user currency. An operation without a known instrument is
+            # taken as is: the debt account itself is always in the user's currency.
+            is_foreign = bool(
+                original_currency and original_currency != currency_code and rate and user_rate
+            )
+            amount = original_amount * rate / user_rate if is_foreign else original_amount
+
+            # Update balance (positive: they owe me). An operation that reduces
+            # what is outstanding is a repayment, any other one is a new loan.
+            balance_before = counterparties_data[counterparty]["balance"]
+            balance_after = balance_before + amount if given else balance_before - amount
+            counterparties_data[counterparty]["balance"] = balance_after
+
+            is_repayment = abs(balance_after) < abs(balance_before)
+            if given:
+                tx_type = "you_repaid" if is_repayment else "you_lent"
+            else:
+                tx_type = "they_repaid" if is_repayment else "you_borrowed"
+
+            history_entry = {
                 "date": row["date"],
                 "amount": round(amount, 2),
                 "type": tx_type,
                 "comment": row["comment"],
-            })
+            }
+            if is_foreign:
+                history_entry["original_amount"] = round(original_amount, 2)
+                history_entry["original_currency"] = original_currency
+            counterparties_data[counterparty]["history"].append(history_entry)
 
     # Format counterparties
     by_counterparty = []
     for cp_data in counterparties_data.values():
-        net_balance = cp_data["balance"]
+        # Rounded first: converted amounts leave float dust on a repaid debt
+        net_balance = round(cp_data["balance"], 2)
 
         if net_balance > 0:
             status = "they_owe_you"
@@ -2034,19 +2895,20 @@ def get_debts(db: Database) -> dict[str, Any]:
         else:
             status = "settled"
 
-        # Get last activity
-        if cp_data["history"]:
-            last_activity = cp_data["history"][0]["date"]
+        # Get last activity (history is oldest first)
+        history = cp_data["history"][::-1]
+        if history:
+            last_activity = history[0]["date"]
         else:
             last_activity = None
 
         by_counterparty.append({
             "counterparty": cp_data["name"],
             "merchant_id": cp_data["merchant_id"],
-            "net_amount": round(net_balance, 2),
+            "net_amount": net_balance,
             "status": status,
             "last_activity": last_activity,
-            "transactions": cp_data["history"][:10],  # Last 10 transactions
+            "transactions": history[:10],  # Last 10 transactions
         })
 
     # Sort by absolute balance descending
@@ -2152,8 +3014,17 @@ def analyze_transfers(
             "comment": row["comment"],
         }
 
-        if is_currency_exchange and row["income"] > 0:
-            transfer_data["effective_rate"] = round(row["outcome"] / row["income"], 4)
+        if is_currency_exchange:
+            # Quote the rate the way people say it: the price of one unit of the
+            # dearer currency ("1 USD = 3.8 PLN"), whichever way the money went.
+            base, quote = (
+                ("outcome", "income") if row["outcome"] <= row["income"] else ("income", "outcome")
+            )
+            rate = round(row[quote] / row[base], 4)
+            transfer_data["effective_rate"] = rate
+            transfer_data["rate_description"] = (
+                f"1 {row[f'{base}_currency']} = {rate} {row[f'{quote}_currency']}"
+            )
 
         transfers.append(transfer_data)
         total_amount += amount_user
@@ -2208,7 +3079,9 @@ def detect_anomalies(
         end_date: Optional explicit end date (ISO). Used with start_date.
 
     Returns:
-        Dictionary with detected anomalies.
+        Dictionary with outliers (payments far above their category's average,
+        strongest first) and groups of possible duplicates (largest first), each
+        cut to 15 with the total count in the summary.
     """
     # Enforce minimum z_threshold
     z_threshold = max(z_threshold, 1.5)
@@ -2230,13 +3103,16 @@ def detect_anomalies(
     # Build query with optional category filter
     query = """
         SELECT
-            t.id, t.date, t.outcome, t.outcome_instrument, t.tag, t.merchant, t.payee,
+            t.id, t.date, t.outcome, t.outcome_instrument, t.merchant, t.payee,
             t.comment,
+            json_extract(t.tag, '$[0]') as tag_id,
             m.title as merchant_title,
-            tag.title as tag_title
+            tag.title as tag_title,
+            i.rate
         FROM transactions t
         LEFT JOIN merchants m ON m.id = t.merchant
         LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
+        LEFT JOIN instruments i ON i.id = t.outcome_instrument
         WHERE t.deleted = 0
           AND (t.hold IS NULL OR t.hold = 0)
           AND NOT (t.income > 0 AND t.outcome > 0)
@@ -2263,63 +3139,36 @@ def detect_anomalies(
     outliers = []
     duplicates = []
 
-    # Detect amount outliers by category
-    category_stats = {}
+    # Convert every amount to user currency once: both checks below reuse it
+    amounts = {}
     for row in rows:
-        tag_json = row["tag"]
-        if tag_json:
-            try:
-                tags = json.loads(tag_json)
-                category = tags[0] if tags else None
-            except:
-                category = None
-        else:
-            category = None
-
-        if category not in category_stats:
-            category_stats[category] = []
         amount = row["outcome"]
-        instrument_id = row["outcome_instrument"]
-        if instrument_id and instrument_id != user_currency_id:
-            source_rate = db.get_instrument_rate(instrument_id)
-            amount = amount * source_rate / user_rate if user_rate else amount
-        category_stats[category].append(amount)
+        if row["rate"] and user_rate and row["outcome_instrument"] != user_currency_id:
+            amount = amount * row["rate"] / user_rate
+        amounts[row["id"]] = amount
 
-    # Calculate stats for each category
-    for category, amounts in category_stats.items():
-        if len(amounts) < 3:
+    # Detect amount outliers by category
+    category_rows: dict[str | None, list[Any]] = {}
+    for row in rows:
+        category_rows.setdefault(row["tag_id"], []).append(row)
+
+    for rows_in_category in category_rows.values():
+        if len(rows_in_category) < 3:
             continue  # Need at least 3 for meaningful stats
 
-        mean = sum(amounts) / len(amounts)
-        variance = sum((x - mean) ** 2 for x in amounts) / len(amounts)
+        values = [amounts[row["id"]] for row in rows_in_category]
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
         stddev = variance ** 0.5
 
         if stddev == 0:
             continue
 
         # Find outliers
-        for row in rows:
-            tag_json = row["tag"]
-            if tag_json:
-                try:
-                    tags = json.loads(tag_json)
-                    row_category = tags[0] if tags else None
-                except:
-                    row_category = None
-            else:
-                row_category = None
-
-            if row_category != category:
-                continue
-
-            amount = row["outcome"]
-            instrument_id = row["outcome_instrument"]
-            if instrument_id and instrument_id != user_currency_id:
-                source_rate = db.get_instrument_rate(instrument_id)
-                amount = amount * source_rate / user_rate if user_rate else amount
-
-            z_score = abs(amount - mean) / stddev
-            if z_score > z_threshold:
+        for row, amount in zip(rows_in_category, values):
+            # Only unusually large spending is an anomaly, not a small payment
+            z_score = (amount - mean) / stddev
+            if z_score >= z_threshold:
                 outliers.append({
                     "transaction_id": row["id"],
                     "date": row["date"],
@@ -2332,52 +3181,52 @@ def detect_anomalies(
                     "severity": "high" if z_score >= 3.0 else ("medium" if z_score >= 2.0 else "low"),
                 })
 
-    # Detect possible duplicates (same amount, date ±1 day, same payee)
-    checked_pairs = set()
-    for i, row1 in enumerate(rows):
-        for row2 in rows[i+1:]:
-            pair_key = tuple(sorted([row1["id"], row2["id"]]))
-            if pair_key in checked_pairs:
+    # Detect possible duplicates (same payee, same amount, dates within a day of each
+    # other) in one pass: bucket by payee and amount, then split each bucket by date
+    same_payee_and_amount: dict[tuple[str, float], list[Any]] = {}
+    for row in rows:
+        payee = row["merchant_title"] or row["payee"]
+        if payee:
+            same_payee_and_amount.setdefault((payee, round(amounts[row["id"]], 2)), []).append(row)
+
+    for (payee, amount), bucket in same_payee_and_amount.items():
+        if len(bucket) < 2:
+            continue
+
+        bucket.sort(key=lambda row: row["date"])
+        runs = [[bucket[0]]]
+        for row in bucket[1:]:
+            previous_date = date.fromisoformat(runs[-1][-1]["date"])
+            if (date.fromisoformat(row["date"]) - previous_date).days <= 1:
+                runs[-1].append(row)
+            else:
+                runs.append([row])
+
+        # Three identical payments are one group of 3, not three pairs
+        for run in runs:
+            if len(run) < 2:
                 continue
-            checked_pairs.add(pair_key)
+            duplicates.append({
+                "transactions": [row["id"] for row in run],
+                "count": len(run),
+                "date": run[0]["date"],
+                "amount": amount,
+                "payee": payee,
+                "severity": "medium",
+            })
 
-            # Convert amounts to user currency for comparison
-            amount1 = row1["outcome"]
-            instr1 = row1["outcome_instrument"]
-            if instr1 and instr1 != user_currency_id:
-                source_rate = db.get_instrument_rate(instr1)
-                amount1 = amount1 * source_rate / user_rate if user_rate else amount1
-
-            amount2 = row2["outcome"]
-            instr2 = row2["outcome_instrument"]
-            if instr2 and instr2 != user_currency_id:
-                source_rate = db.get_instrument_rate(instr2)
-                amount2 = amount2 * source_rate / user_rate if user_rate else amount2
-
-            # Check if amounts are close
-            if abs(amount1 - amount2) < 0.01:
-                # Check if dates are close
-                date1 = date.fromisoformat(row1["date"])
-                date2 = date.fromisoformat(row2["date"])
-                if abs((date1 - date2).days) <= 1:
-                    # Check if payees match
-                    payee1 = row1["merchant_title"] or row1["payee"] or ""
-                    payee2 = row2["merchant_title"] or row2["payee"] or ""
-                    if payee1 and payee2 and payee1 == payee2:
-                        duplicates.append({
-                            "transactions": [row1["id"], row2["id"]],
-                            "date": row1["date"],
-                            "amount": round(amount1, 2),
-                            "payee": payee1,
-                            "severity": "medium",
-                        })
+    # Strongest outliers and largest duplicates first, so that the cut keeps the ones that matter
+    outliers.sort(key=lambda x: (x["z_score"], x["amount"]), reverse=True)
+    duplicates.sort(key=lambda x: (x["amount"], x["count"]), reverse=True)
 
     return {
         "period": {"start": start_date, "end": end_date},
         "currency": currency_code,
         "summary": {
             "outliers_count": len(outliers),
+            "outliers_returned": min(len(outliers), 15),
             "duplicates_count": len(duplicates),
+            "duplicates_returned": min(len(duplicates), 15),
             "total_transactions_analyzed": len(rows),
         },
         "outliers": outliers[:15],
@@ -2385,16 +3234,37 @@ def detect_anomalies(
     }
 
 
+# What a transaction adds to (credited) or takes from (debited) one account, in
+# that account's currency. A side's instrument is the account's own, except on a
+# debt account: its rows carry the currency of the other account (see Transaction
+# in the API doc). Those are converted at the current rates, which is also how
+# the debt account's balance is kept.
+_ACCOUNT_CREDITED_SQL = """
+    CASE WHEN t.income_account = :account THEN t.income * CASE
+        WHEN t.income_instrument = :instrument THEN 1.0
+        ELSE COALESCE(ii.rate / :rate, 1.0) END
+    ELSE 0 END"""
+_ACCOUNT_DEBITED_SQL = """
+    CASE WHEN t.outcome_account = :account THEN t.outcome * CASE
+        WHEN t.outcome_instrument = :instrument THEN 1.0
+        ELSE COALESCE(oi.rate / :rate, 1.0) END
+    ELSE 0 END"""
+
+
 def get_account_flow(
     db: Database,
     account_id: str,
-    period: str,
+    period: str = "this_month",
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
     """Get cash flow for a specific account.
 
     T14: "What happened on my card?", "Cash flow details"
+
+    All amounts are in the account's own currency. net_change covers income,
+    outcome and transfers both ways, so opening_balance + net_change =
+    closing_balance.
 
     Args:
         db: Database instance.
@@ -2409,55 +3279,60 @@ def get_account_flow(
     conn = db.connect()
     start_date, end_date = get_period_dates(period, start_date=start_date, end_date=end_date)
 
-    # Get account info
-    account_row = conn.execute(
-        "SELECT title, type, balance, instrument FROM accounts WHERE id = ?",
-        (account_id,)
-    ).fetchone()
+    # Get account info. Every amount below is in this account's own currency:
+    # it is one account, so nothing is converted to the user's currency.
+    account_row = conn.execute("""
+        SELECT a.title, a.type, a.balance, a.instrument,
+               i.short_title AS currency, i.rate
+        FROM accounts a
+        LEFT JOIN instruments i ON i.id = a.instrument
+        WHERE a.id = ?
+    """, (account_id,)).fetchone()
 
     if not account_row:
         raise ValueError(f"Account {account_id} not found")
 
     account_title = account_row["title"]
     account_type = account_row["type"]
+    account_currency = account_row["currency"]
     current_balance = account_row["balance"] or 0
-
-    # Get user currency
-    user_currency_id = db.get_user_currency()
-    if not user_currency_id:
-        user_currency_id = 2  # Default to RUB
-
-    currency_row = conn.execute(
-        "SELECT short_title FROM instruments WHERE id = ?",
-        (user_currency_id,)
-    ).fetchone()
-    currency_code = currency_row["short_title"] if currency_row else "RUB"
+    account_params = {
+        "account": account_id,
+        "instrument": account_row["instrument"],
+        "rate": account_row["rate"],
+    }
 
     # Query all transactions involving this account
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT
-            t.id, t.date, t.income, t.outcome, t.comment,
+            t.id, t.date, t.income, t.outcome, t.hold, t.comment,
             t.income_account, t.outcome_account,
             t.income_instrument, t.outcome_instrument,
             t.tag, t.merchant, t.payee,
+            {_ACCOUNT_CREDITED_SQL} AS credited,
+            {_ACCOUNT_DEBITED_SQL} AS debited,
             m.title as merchant_title,
             tag.title as tag_title,
             ia.title as income_account_title,
-            oa.title as outcome_account_title
+            oa.title as outcome_account_title,
+            ii.short_title as income_currency,
+            oi.short_title as outcome_currency
         FROM transactions t
         LEFT JOIN merchants m ON m.id = t.merchant
         LEFT JOIN tags tag ON tag.id = json_extract(t.tag, '$[0]')
         LEFT JOIN accounts ia ON ia.id = t.income_account
         LEFT JOIN accounts oa ON oa.id = t.outcome_account
+        LEFT JOIN instruments ii ON ii.id = t.income_instrument
+        LEFT JOIN instruments oi ON oi.id = t.outcome_instrument
         WHERE t.deleted = 0
-          AND t.date >= ? AND t.date <= ?
-          AND (t.income_account = ? OR t.outcome_account = ?)
+          AND t.date >= :start AND t.date <= :end
+          AND (t.income_account = :account OR t.outcome_account = :account)
         ORDER BY t.date DESC
-    """, (start_date, end_date, account_id, account_id)).fetchall()
+    """, {**account_params, "start": start_date, "end": end_date}).fetchall()
 
     # Categorize transactions
-    income_total = 0.0
-    outcome_total = 0.0
+    totals = {"income": 0.0, "outcome": 0.0, "transfer_in": 0.0, "transfer_out": 0.0}
+    holds_excluded = 0
     by_category_map = {}
     transactions = []
 
@@ -2473,41 +3348,50 @@ def get_account_flow(
             # Pure income
             if income_account == account_id:
                 tx_type = "income"
-                amount = income
-                income_total += income
             else:
                 continue
         elif income == 0 and outcome > 0:
             # Pure expense
             if outcome_account == account_id:
                 tx_type = "outcome"
-                amount = outcome
-                outcome_total += outcome
             else:
                 continue
         elif income > 0 and outcome > 0:
             # Transfer or exchange
             if income_account == account_id and outcome_account != account_id:
                 tx_type = "transfer_in"
-                amount = income
             elif outcome_account == account_id and income_account != account_id:
                 tx_type = "transfer_out"
-                amount = outcome
             else:
                 continue
         else:
             continue
 
+        # The account's side of the transaction, in the account's currency
+        side = "income" if tx_type in ["income", "transfer_in"] else "outcome"
+        amount = row["credited"] if side == "income" else row["debited"]
+
+        # Totals and balances are built from the rows accounts.balance itself
+        # consists of: not deleted and not on hold (checked against real balances -
+        # a pending hold is not in the balance yet). Holds stay in the list,
+        # flagged, so that pending card payments remain visible.
+        on_hold = bool(row["hold"])
+        if on_hold:
+            holds_excluded += 1
+        else:
+            totals[tx_type] += amount
+
         # Category aggregation (only for income/outcome, not transfers)
-        if tx_type in ["income", "outcome"]:
+        if tx_type in ["income", "outcome"] and not on_hold:
+            # Income and spending in one category are separate lines (a refund
+            # on a category is not more spending in it)
             category = row["tag_title"] or "Uncategorized"
-            if category not in by_category_map:
-                by_category_map[category] = {"type": tx_type, "total": 0.0, "count": 0}
-            by_category_map[category]["total"] += amount
-            by_category_map[category]["count"] += 1
+            line = by_category_map.setdefault((category, tx_type), {"total": 0.0, "count": 0})
+            line["total"] += amount
+            line["count"] += 1
 
         # Transaction list
-        transactions.append({
+        transaction = {
             "id": row["id"],
             "date": row["date"],
             "type": tx_type,
@@ -2515,43 +3399,81 @@ def get_account_flow(
             "category": row["tag_title"],
             "payee": row["merchant_title"] or row["payee"],
             "comment": row["comment"],
+            # The other side: the payee of a payment, the other account of a transfer
             "counterparty": (
-                row["outcome_account_title"] if tx_type in ["transfer_in", "income"]
+                row["merchant_title"] or row["payee"] if tx_type in ["income", "outcome"]
+                else row["outcome_account_title"] if tx_type == "transfer_in"
                 else row["income_account_title"]
             ),
-        })
+            "hold": on_hold,
+        }
+        if row[f"{side}_instrument"] != account_row["instrument"]:
+            # Converted above: keep what the transaction itself says
+            transaction["original_amount"] = round(row[side], 2)
+            transaction["original_currency"] = row[f"{side}_currency"]
+        transactions.append(transaction)
 
-    # Calculate net change
-    net_change = income_total - outcome_total
+    # Net change covers every movement of the account, transfers included:
+    # only then does it match how the balance moved. The figures are rounded
+    # before they are combined, so that the reported ones add up to the cent.
+    totals = {kind: round(total, 2) for kind, total in totals.items()}
+    net_change = round(
+        totals["income"] + totals["transfer_in"] - totals["outcome"] - totals["transfer_out"], 2
+    )
+
+    # The cache keeps only today's balance, so the balance at the end of the
+    # period is today's balance with every later movement rolled back.
+    moved_after_period = conn.execute(f"""
+        SELECT COALESCE(SUM({_ACCOUNT_CREDITED_SQL} - {_ACCOUNT_DEBITED_SQL}), 0) AS total
+        FROM transactions t
+        LEFT JOIN instruments ii ON ii.id = t.income_instrument
+        LEFT JOIN instruments oi ON oi.id = t.outcome_instrument
+        WHERE t.deleted = 0
+          AND (t.hold IS NULL OR t.hold = 0)
+          AND t.date > :end
+          AND (t.income_account = :account OR t.outcome_account = :account)
+    """, {**account_params, "end": end_date}).fetchone()["total"]
+    closing_balance = round(current_balance - moved_after_period, 2)
+    opening_balance = round(closing_balance - net_change, 2)
 
     # Format by_category
     by_category = [
         {
             "category": cat,
-            "type": stats["type"],
+            "type": tx_type,
             "total": round(stats["total"], 2),
             "count": stats["count"],
         }
-        for cat, stats in by_category_map.items()
+        for (cat, tx_type), stats in by_category_map.items()
     ]
     by_category.sort(key=lambda x: x["total"], reverse=True)
+
+    returned = transactions[:50]  # Limit to 50; the summary covers all of them
 
     return {
         "account": {
             "id": account_id,
             "title": account_title,
             "type": account_type,
+            "currency": account_currency,
             "balance": round(current_balance, 2),
         },
         "period": {"start": start_date, "end": end_date},
         "summary": {
-            "total_income": round(income_total, 2),
-            "total_outcome": round(outcome_total, 2),
-            "net_change": round(net_change, 2),
-            "transaction_count": len(transactions),
+            "currency": account_currency,
+            "income": totals["income"],
+            "outcome": totals["outcome"],
+            "transfers_in": totals["transfer_in"],
+            "transfers_out": totals["transfer_out"],
+            "net_change": net_change,
+            "opening_balance": opening_balance,
+            "closing_balance": closing_balance,
+            "holds_excluded": holds_excluded,
             "by_category": by_category,
         },
-        "transactions": transactions[:50],  # Limit to 50
+        "total_count": len(transactions),
+        "returned_count": len(returned),
+        "transactions": returned,
     }
 
 
@@ -2628,12 +3550,30 @@ async def suggest_category(
                 "name": tag_map.get(tag_id, tag_id),
             })
 
+    # The API names the merchant by id only; the title comes from the local cache
+    merchant_id = data.get("merchant")
+    merchant_title = None
+    if merchant_id:
+        merchant_row = conn.execute(
+            "SELECT title FROM merchants WHERE id = ?", (merchant_id,)
+        ).fetchone()
+        merchant_title = merchant_row["title"] if merchant_row else None
+
     return {
         "original_payee": payee,
         "normalized_payee": data.get("payee", payee),
-        "suggested_merchant_id": data.get("merchant"),
+        "suggested_merchant": merchant_title,
+        "suggested_merchant_id": merchant_id,
         "suggested_categories": tag_titles,
     }
+
+
+_SEARCH_MAX_LIMIT = 200
+
+
+def _casefold(value: Any) -> Any:
+    """Case folding for any script, for use in SQL (SQLite's LOWER and LIKE fold ASCII only)."""
+    return value.casefold() if isinstance(value, str) else value
 
 
 def search_transactions(
@@ -2656,7 +3596,8 @@ def search_transactions(
 
     Args:
         db: Database instance.
-        period: Optional time period filter.
+        period: Optional time period filter. Without it and without dates the
+            whole history is searched.
         category_id: Filter by category (includes children).
         account_id: Filter by account.
         merchant_id: Filter by merchant.
@@ -2664,13 +3605,21 @@ def search_transactions(
         min_amount: Minimum transaction amount.
         max_amount: Maximum transaction amount.
         tx_type: Transaction type ("income", "outcome", "transfer").
-        limit: Maximum results to return.
+        limit: Maximum results to return (1 to 200).
         start_date: Optional explicit start date (ISO). Overrides period.
-        end_date: Optional explicit end date (ISO). Used with start_date.
+        end_date: Optional explicit end date (ISO). Without start_date (and
+            without period) everything up to this date is searched.
 
     Returns:
-        Dictionary with matching transactions.
+        Dictionary with matching transactions and the period searched.
+
+    Raises:
+        ValueError: If limit is out of range or the period/dates are invalid.
     """
+    # SQLite reads a negative LIMIT as "no limit", so the range is enforced here
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _SEARCH_MAX_LIMIT:
+        raise ValueError(f"Invalid limit {limit!r}: expected an integer from 1 to {_SEARCH_MAX_LIMIT}")
+
     conn = db.connect()
 
     # Get user currency for display
@@ -2698,11 +3647,30 @@ def search_transactions(
     """
     params: list[Any] = []
 
-    # Period filter
+    # Period filter. Unlike the reports, a search may be open-ended: with no
+    # period at all it covers the whole history, with end_date alone everything
+    # up to that date. The output says which dates were actually searched.
+    period_info: dict[str, Any]
     if start_date or period:
         sd, ed = get_period_dates(period or "this_month", start_date=start_date, end_date=end_date)
         query += " AND t.date BETWEEN ? AND ?"
         params.extend([sd, ed])
+        period_info = {"start": sd, "end": ed}
+    elif end_date:
+        ed = parse_iso_date(end_date, "end_date").isoformat()
+        query += " AND t.date <= ?"
+        params.append(ed)
+        period_info = {
+            "start": None,
+            "end": ed,
+            "note": "No start_date given: everything up to end_date was searched",
+        }
+    else:
+        period_info = {
+            "start": None,
+            "end": None,
+            "note": "No period or dates given: the whole history was searched",
+        }
 
     # Category filter (with children)
     if category_id:
@@ -2726,16 +3694,20 @@ def search_transactions(
         query += " AND t.merchant = ?"
         params.append(merchant_id)
 
-    # Payee search (LIKE on payee, original_payee, comment, merchant.title)
+    # Payee search (substring of payee, original_payee, comment, merchant.title).
+    # Case is folded in Python: SQLite on its own would miss "кофе" in "Кофе".
+    # Database caches one connection, so registering the function on every
+    # call is cheap and also covers a connection re-opened after close().
+    # instr() rather than LIKE: the query is plain text, "%" and "_" included.
     if payee_search:
-        search_pattern = f"%{payee_search}%"
+        conn.create_function("zm_casefold", 1, _casefold, deterministic=True)
         query += """ AND (
-            t.payee LIKE ? OR
-            t.original_payee LIKE ? OR
-            t.comment LIKE ? OR
-            m.title LIKE ?
+            instr(zm_casefold(t.payee), ?) > 0 OR
+            instr(zm_casefold(t.original_payee), ?) > 0 OR
+            instr(zm_casefold(t.comment), ?) > 0 OR
+            instr(zm_casefold(m.title), ?) > 0
         )"""
-        params.extend([search_pattern] * 4)
+        params.extend([_casefold(payee_search)] * 4)
 
     # Amount filters — compare in the user's currency so thresholds are meaningful
     # across multi-currency accounts. Transaction amounts are stored in each
@@ -2838,7 +3810,7 @@ def search_transactions(
         # Get payee/merchant
         payee = row["merchant_title"] or row["payee"] or row["comment"]
 
-        transactions.append({
+        transaction = {
             "id": row["id"],
             "date": row["date"],
             "type": tx_type_str,
@@ -2849,9 +3821,24 @@ def search_transactions(
             "payee": payee,
             "comment": row["comment"] if row["comment"] != payee else None,
             "hold": bool(row["hold"]),
-        })
+        }
+        if tx_type_str == "transfer":
+            # "amount" above is the outgoing side only; an exchange arrives as a
+            # different amount in a different currency, so spell out both sides
+            transaction["from"] = {
+                "account": row["outcome_account_title"],
+                "amount": outcome,
+                "currency": row["outcome_currency"],
+            }
+            transaction["to"] = {
+                "account": row["income_account_title"],
+                "amount": income,
+                "currency": row["income_currency"],
+            }
+        transactions.append(transaction)
 
     return {
+        "period": period_info,
         "transactions": transactions,
         "returned_count": len(transactions),
         "total_matching": total_count,
@@ -2883,18 +3870,21 @@ def get_accounts_resource(db: Database) -> dict[str, Any]:
         ORDER BY a.in_balance DESC, a.balance DESC
     """).fetchall()
 
-    total_converted = 0.0
+    in_balance_total = 0.0  # what the ZenMoney app shows as the balance
+    off_balance_total = 0.0
     accounts = []
     for row in rows:
         balance = row["balance"] or 0
-        if row["in_balance"]:
-            instrument_row = conn.execute(
-                "SELECT id FROM instruments WHERE short_title = ?",
-                (row["currency"],)
-            ).fetchone()
-            if instrument_row:
-                converted = convert_to_user_currency(balance, instrument_row["id"], db, user_currency_id)
-                total_converted += converted
+        instrument_row = conn.execute(
+            "SELECT id FROM instruments WHERE short_title = ?",
+            (row["currency"],)
+        ).fetchone()
+        if instrument_row:
+            converted = convert_to_user_currency(balance, instrument_row["id"], db, user_currency_id)
+            if row["in_balance"]:
+                in_balance_total += converted
+            else:
+                off_balance_total += converted
 
         accounts.append({
             "id": row["id"],
@@ -2910,7 +3900,8 @@ def get_accounts_resource(db: Database) -> dict[str, Any]:
 
     return {
         "accounts": accounts,
-        "total_in_user_currency": round(total_converted, 2),
+        "in_balance_total": round(in_balance_total, 2),
+        "off_balance_total": round(off_balance_total, 2),
         "user_currency": user_currency,
     }
 
@@ -2965,9 +3956,12 @@ def get_categories_resource(db: Database) -> dict[str, Any]:
 
 
 def get_current_budgets_resource(db: Database) -> dict[str, Any]:
-    """R3: Get current month budgets for LLM context."""
-    conn = db.connect()
+    """R3: Get current month budgets for LLM context.
 
+    Expense plans by top-level category, built the same way as in
+    check_budget_health: scheduled operations and subcategories included,
+    the month total reported apart from the categories it covers.
+    """
     # Resolve the user's current BUDGET month (respects month_start_day), matching
     # check_budget_health. Using the calendar month would return the wrong budget
     # near the month boundary when month_start_day != 1.
@@ -2975,39 +3969,54 @@ def get_current_budgets_resource(db: Database) -> dict[str, Any]:
     month_start_day = db.get_user_month_start_day()
     target_year, target_month = _current_budget_month(month_start_day, today)
     budget_date = date(target_year, target_month, 1).isoformat()
+    period_start, period_end = _compute_budget_period(
+        month_start_day, target_year, target_month
+    )
 
-    rows = conn.execute("""
-        SELECT b.tag, b.outcome, b.outcome_lock, b.income, b.income_lock,
-               t.title as tag_title
-        FROM budgets b
-        LEFT JOIN tags t ON t.id = b.tag
-        WHERE b.date = ?
-        ORDER BY b.outcome DESC
-    """, (budget_date,)).fetchall()
+    _, currency_code, user_rate = _budget_currency(db)
+    plan = _load_budget_plan(db, budget_date, period_start, period_end, user_rate)
 
+    def budget_line(line: dict[str, Any]) -> dict[str, Any]:
+        data = {
+            "tag_id": line["tag_id"],
+            "tag_title": line["name"],
+            "planned_outcome": round(line["planned"], 2),
+            "outcome_locked": line["locked"],
+        }
+        if line["breakdown"]:
+            data["planned_breakdown"] = line["breakdown"]
+        return data
+
+    # A plan of zero or less is not a budget
     budgets = []
-    for row in rows:
-        tag_id = row["tag"]
-        tag_title = row["tag_title"]
+    for entry in plan["entries"]:
+        if entry["planned"] <= 0:
+            continue
+        budget = budget_line(entry)
+        subcategories = [budget_line(child) for child in entry["subcategories"] if child["planned"] > 0]
+        if subcategories:
+            subcategories.sort(key=lambda x: x["planned_outcome"], reverse=True)
+            budget["subcategories"] = subcategories
+        budgets.append(budget)
 
-        # Special case for total budget
-        if tag_id == "00000000-0000-0000-0000-000000000000":
-            tag_title = "Monthly total"
-        elif not tag_title:
-            tag_title = "Uncategorized"
+    budgets.sort(key=lambda x: x["planned_outcome"], reverse=True)
 
-        budgets.append({
-            "tag_id": tag_id,
-            "tag_title": tag_title,
-            "planned_outcome": row["outcome"],
-            "outcome_locked": bool(row["outcome_lock"]),
-            "planned_income": row["income"],
-            "income_locked": bool(row["income_lock"]),
-        })
+    overall = plan["overall"]
+    total = {
+        "tag_title": "Monthly total",
+        "planned_outcome": round(overall["planned"], 2),
+        "planned_source": overall["source"],
+    }
+    if "breakdown" in overall:
+        total["planned_breakdown"] = overall["breakdown"]
 
     return {
         "month": f"{target_year:04d}-{target_month:02d}",
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "currency": currency_code,
         "budgets": budgets,
+        "total": total,
     }
 
 
@@ -3059,6 +4068,31 @@ def get_instruments_resource(db: Database) -> dict[str, Any]:
     }
 
 
+_MAX_CONVERT_AMOUNT = 1e15
+
+
+def _round_keep_small(value: float, decimals: int) -> float:
+    """Round to `decimals` places; a value below 1 keeps `decimals` significant digits instead.
+
+    Fixed decimals flatten the rate of a weak currency: 1 IRR is about 0.0000006 USD,
+    which rounds to 0.000001 or, in a description, to 0.0.
+    """
+    if abs(value) >= 1:
+        return round(value, decimals)
+    return float(f"{value:.{decimals}g}")
+
+
+def _unit_label(code: str, symbol: str | None) -> str:
+    """Unit to name in a rate: the code, or the symbol when it is a scaled form of the code.
+
+    ZenMoney keeps crypto in micro-units: the instrument with code BTC has the
+    symbol μBTC, and "1 BTC = 0.09 USD" would be off by a factor of a million.
+    """
+    if symbol and symbol != code and symbol.endswith(code):
+        return symbol
+    return code
+
+
 def convert_currency(
     db: Database,
     amount: float,
@@ -3071,6 +4105,9 @@ def convert_currency(
     All rates are stored relative to RUB, so cross-rates are calculated as:
     amount_to = amount * from_rate / to_rate
 
+    Amounts are in the instrument's own unit and are never rescaled; title and
+    symbol are returned so the unit is visible (crypto is kept in micro-units).
+
     Args:
         db: Database instance.
         amount: Amount to convert.
@@ -3079,17 +4116,33 @@ def convert_currency(
 
     Returns:
         Conversion result with rate and converted amount.
+
+    Raises:
+        ValueError: If the amount is not a finite number of a sane size, or a
+            currency code is blank.
     """
+    # NaN and infinity fail the comparison too; a huge amount would overflow into
+    # Infinity, which is not valid JSON.
+    is_number = isinstance(amount, (int, float)) and not isinstance(amount, bool)
+    if not is_number or not abs(amount) <= _MAX_CONVERT_AMOUNT:
+        raise ValueError(
+            f"Invalid amount {amount!r}: expected a finite number, "
+            f"at most {_MAX_CONVERT_AMOUNT:g} in absolute value"
+        )
+    for field, code in (("from_currency", from_currency), ("to_currency", to_currency)):
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError(f"Invalid {field} {code!r}: expected a currency code like 'USD'")
+
     conn = db.connect()
 
     from_row = conn.execute(
         "SELECT id, title, short_title, symbol, rate FROM instruments WHERE short_title = ?",
-        (from_currency.upper(),),
+        (from_currency.strip().upper(),),
     ).fetchone()
 
     to_row = conn.execute(
         "SELECT id, title, short_title, symbol, rate FROM instruments WHERE short_title = ?",
-        (to_currency.upper(),),
+        (to_currency.strip().upper(),),
     ).fetchone()
 
     if not from_row:
@@ -3104,7 +4157,7 @@ def convert_currency(
         return {"error": f"Rate for {to_currency} is 0, conversion not possible"}
 
     cross_rate = from_rate / to_rate
-    converted = round(amount * cross_rate, 2)
+    converted = _round_keep_small(amount * cross_rate, 2)
 
     # Also get user currency for context
     user_currency_id = db.get_user_currency()
@@ -3119,22 +4172,27 @@ def convert_currency(
         "from": {
             "amount": amount,
             "currency": from_row["short_title"],
+            "title": from_row["title"],
             "symbol": from_row["symbol"],
         },
         "to": {
             "amount": converted,
             "currency": to_row["short_title"],
+            "title": to_row["title"],
             "symbol": to_row["symbol"],
         },
-        "rate": round(cross_rate, 6),
-        "inverse_rate": round(1 / cross_rate, 6) if cross_rate != 0 else None,
-        "rate_description": f"1 {from_row['short_title']} = {round(cross_rate, 4)} {to_row['short_title']}",
+        "rate": _round_keep_small(cross_rate, 6),
+        "inverse_rate": _round_keep_small(1 / cross_rate, 6) if cross_rate != 0 else None,
+        "rate_description": (
+            f"1 {_unit_label(from_row['short_title'], from_row['symbol'])} = "
+            f"{_round_keep_small(cross_rate, 4)} {_unit_label(to_row['short_title'], to_row['symbol'])}"
+        ),
     }
 
     if user_row and user_row["short_title"] not in (from_row["short_title"], to_row["short_title"]):
         user_rate = from_rate / user_row["rate"] if user_row["rate"] != 0 else 0
         result["in_user_currency"] = {
-            "amount": round(amount * user_rate, 2),
+            "amount": _round_keep_small(amount * user_rate, 2),
             "currency": user_row["short_title"],
             "symbol": user_row["symbol"],
         }
@@ -3153,12 +4211,24 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
         currencies: Optional list of currency codes to include.
 
     Returns:
-        Exchange rate table with cross-rates.
+        Exchange rate table with cross-rates. Requested codes that ZenMoney does
+        not know are listed in unknown_currencies.
+
+    Raises:
+        ValueError: If currencies is not a list of currency codes.
     """
     conn = db.connect()
 
     if currencies:
-        codes = [c.upper() for c in currencies]
+        is_code_list = isinstance(currencies, (list, tuple)) and all(
+            isinstance(c, str) and c.strip() for c in currencies
+        )
+        if not is_code_list:
+            raise ValueError(
+                f"Invalid currencies {currencies!r}: expected a list of currency codes like ['USD', 'EUR']"
+            )
+        # Normalize and de-duplicate, keeping the requested order
+        codes = list(dict.fromkeys(c.strip().upper() for c in currencies))
     else:
         # Get currencies from user's active accounts
         rows = conn.execute("""
@@ -3181,17 +4251,20 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
     ).fetchall()
 
     instr_map = {r["short_title"]: r for r in instruments}
+    unknown_codes = [code for code in codes if code not in instr_map]
 
     # Get user currency
     user_currency_id = db.get_user_currency()
     user_code = None
+    user_rate = None
     if user_currency_id:
         user_row = conn.execute(
-            "SELECT short_title FROM instruments WHERE id = ?",
+            "SELECT short_title, rate FROM instruments WHERE id = ?",
             (int(user_currency_id),),
         ).fetchone()
         if user_row:
             user_code = user_row["short_title"]
+            user_rate = user_row["rate"]
 
     # Build cross-rate table
     cross_rates = {}
@@ -3205,7 +4278,7 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
                 continue
             rate_to = instr_map[other_code]["rate"]
             if rate_to != 0:
-                rates[other_code] = round(rate_from / rate_to, 6)
+                rates[other_code] = _round_keep_small(rate_from / rate_to, 6)
         cross_rates[code] = rates
 
     # Build summary list
@@ -3220,14 +4293,16 @@ def get_exchange_rates(db: Database, currencies: list[str] | None = None) -> dic
             "title": r["title"],
             "rate_to_rub": r["rate"],
         }
-        if user_code and user_code in cross_rates.get(code, {}):
-            entry[f"rate_to_{user_code}"] = cross_rates[code][user_code]
+        # Always given, whether or not the user's currency was requested
+        if user_rate and code != user_code:
+            entry[f"rate_to_{user_code}"] = _round_keep_small(r["rate"] / user_rate, 6)
         rate_list.append(entry)
 
     return {
         "user_currency": user_code,
         "currencies": rate_list,
         "cross_rates": cross_rates,
+        "unknown_currencies": unknown_codes,
         "rate_source": "cbr",
         "note": "Rates from ZenMoney (Central Bank of Russia, updated on sync). rate_to_rub = cost of 1 unit in RUB.",
     }

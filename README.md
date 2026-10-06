@@ -35,8 +35,8 @@ Plus 6 resources: accounts, categories, budgets, merchants, currencies, sync sta
 git clone https://github.com/nnslvp/zenmoney-mcp.git ~/zenmoney-mcp
 cd ~/zenmoney-mcp
 
-# Install with uv (recommended)
-uv venv && uv pip install -e ".[dev]"
+# Install with uv (recommended; uses the locked dependency versions)
+uv sync --extra dev
 
 # Or with pip
 python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -83,7 +83,7 @@ claude mcp add zenmoney ~/zenmoney-mcp/.venv/bin/zenmoney-mcp -e ZENMONEY_TOKEN=
 
 ## How it works
 
-1. **Sync**: downloads your ZenMoney data via `/v8/diff/` API into a local SQLite cache (`~/.cache/zenmoney-mcp/zenmoney.db`)
+1. **Sync**: downloads your ZenMoney data via `/v8/diff/` API into a local SQLite cache (`~/.cache/zenmoney-mcp/zenmoney.db`). A cache older than 10 minutes is refreshed before answering (`ZENMONEY_AUTO_SYNC_SECONDS` changes the threshold, `0` disables auto-sync); every answer carries `data_synced_at`, and `sync_data` forces a refresh.
 2. **Analyze**: 18 tools run SQL queries against the local cache — no data leaves your machine
 3. **Read-only**: the server never writes anything back to ZenMoney
 
@@ -92,6 +92,8 @@ claude mcp add zenmoney ~/zenmoney-mcp/.venv/bin/zenmoney-mcp -e ZENMONEY_TOKEN=
 - Multi-currency support with real exchange rates from ZenMoney
 - Transfer detection (excludes transfers between own accounts from spending)
 - Category hierarchy (parent + child categories in analytics)
+- Periods: `this_month`, `last_month`, `this_year`, `last_year`, `last_N_days`, `YYYY-MM`, `YYYY`, or explicit `start_date`/`end_date`
+- Off-balance accounts are left out of reports, as in ZenMoney itself, but never silently: the amount left out is reported, and `include_off_balance` includes them
 - Budget tracking with pace and overspend alerts
 - Recurring payment detection (subscriptions, bills)
 - Anomaly detection (unusual spending via Z-score)

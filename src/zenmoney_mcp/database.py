@@ -587,6 +587,24 @@ class Database:
         conn.commit()
         return cursor.rowcount
 
+    def retire_orphan_markers(self) -> int:
+        """Mark planned markers whose reminder is gone as deleted.
+
+        When a reminder is deleted the server sends the deletion of the reminder
+        only; its future markers stay in the cache as 'planned' and would be
+        counted as upcoming payments and budgeted expenses forever.
+        Processed markers are history and are kept.
+        """
+        conn = self.connect()
+        cursor = conn.execute("""
+            UPDATE reminder_markers SET state = 'deleted'
+            WHERE state = 'planned'
+              AND reminder IS NOT NULL
+              AND reminder NOT IN (SELECT id FROM reminders)
+        """)
+        conn.commit()
+        return cursor.rowcount
+
     # -------------------------------------------------------------------------
     # Query helpers
     # -------------------------------------------------------------------------

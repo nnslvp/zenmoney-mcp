@@ -198,3 +198,55 @@ class TestSyncEngineWithPopulatedDB:
         assert populated_db.get_instrument_rate(1) == 1.0  # RUB
         assert populated_db.get_instrument_rate(2) == 90.0  # USD
         assert populated_db.get_instrument_rate(3) == 100.0  # EUR
+
+
+class TestDeletedReminderMarkers:
+    """Deleting a reminder leaves its planned markers behind: the server does not
+    send marker updates for them, so the cache must retire them itself."""
+
+    @staticmethod
+    def _marker(marker_id: str, state: str, reminder: str = "rem-1") -> dict:
+        return {
+            "id": marker_id, "user": 1, "reminder": reminder, "date": "2026-10-15",
+            "state": state, "income": 0, "outcome": 100, "outcomeAccount": "acc-1",
+            "changed": 1000000,
+        }
+
+    def _sync_reminder_with_markers(self, sync_engine: SyncEngine) -> None:
+        sync_engine.apply_diff_data({
+            "serverTimestamp": 1000000,
+            "reminder": [{
+                "id": "rem-1", "user": 1, "interval": "month", "step": 1,
+                "startDate": "2026-01-15", "income": 0, "outcome": 100,
+                "outcomeAccount": "acc-1", "changed": 1000000,
+            }],
+            "reminderMarker": [
+                self._marker("rm-planned", "planned"),
+                self._marker("rm-processed", "processed"),
+            ],
+        })
+
+    def test_planned_markers_of_a_deleted_reminder_are_retired(self, sync_engine: SyncEngine):
+        self._sync_reminder_with_markers(sync_engine)
+
+        result = sync_engine.apply_diff_data({
+            "serverTimestamp": 1000001,
+            "deletion": [{"object": "reminder", "id": "rem-1", "stamp": 1000001}],
+        })
+
+        states = dict(sync_engine.db.connect().execute(
+            "SELECT id, state FROM reminder_markers"
+        ).fetchall())
+        assert states == {"rm-planned": "deleted", "rm-processed": "processed"}
+        assert result["deleted"] == {"reminders": 1, "reminder_markers": 1}
+
+    def test_planned_markers_of_a_live_reminder_are_kept(self, sync_engine: SyncEngine):
+        self._sync_reminder_with_markers(sync_engine)
+
+        result = sync_engine.apply_diff_data({"serverTimestamp": 1000001})
+
+        state = sync_engine.db.connect().execute(
+            "SELECT state FROM reminder_markers WHERE id = 'rm-planned'"
+        ).fetchone()["state"]
+        assert state == "planned"
+        assert result["deleted"] == {}

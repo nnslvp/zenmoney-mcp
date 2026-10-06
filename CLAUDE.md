@@ -29,9 +29,12 @@ zenmoney-mcp/
 │       └── utils.py           # Currency conversion, transaction classification
 ├── tests/
 │   ├── conftest.py            # Fixtures: in-memory SQLite with test data
+│   ├── factories.py           # Row factories: insert_transaction(db, outcome=..) etc.
+│   ├── test_server.py         # Protocol-level: tools/resources via an in-memory MCP client, auto-sync
 │   ├── test_database.py
 │   ├── test_sync.py
 │   ├── test_tools.py          # Tests for all 18 tools + 6 resources
+│   ├── test_<area>.py         # Per-area tests: balances, budget, spending, search, recurring, ...
 │   ├── test_utils.py
 │   └── test_integration.py    # Smoke test with real API (needs ZENMONEY_TOKEN)
 └── README.md
@@ -65,11 +68,19 @@ Consult when unclear about: entity structure, `/v8/diff/` format, Budget lock fl
 
 4. **Enrichment via JOIN, not Python dicts.** UUID → human-readable names.
 
-5. **LIMIT on all responses.** search_transactions: 50, analyze_spending: 15. Always return `total_count` + `returned_count`.
+5. **LIMIT on all responses.** search_transactions: 50 (max 200), top_n reports: 10 (max 100). Always return `total_count` + `returned_count`.
 
-6. **Currency conversion:** `amount_user = amount * instrument.rate / user_currency.rate`
+6. **Currency conversion:** `amount_user = amount * instrument.rate / user_currency.rate`. Reminders and reminder markers have no instrument: their amounts are in the currency of their account (JOIN accounts). A debt operation is in the currency of the non-debt account.
 
-7. **Tag hierarchy:** queries on parent category always include children.
+7. **Tag hierarchy:** queries on parent category always include children; overviews fold children into the parent (`subcategories`).
+
+8. **Off-balance accounts** (`in_balance = 0`) are left out of spending/income/budget reports, as in ZenMoney's own reports, but never silently: report `off_balance_excluded` and accept `include_off_balance`. Balances and liquidity count every account and flag it.
+
+9. **Invalid input is an error, never a silent fallback.** Periods and dates go through `get_period_dates` / `parse_iso_date`; raise `ValueError` with a clear message, the server turns it into a tool error.
+
+10. **Freshness:** tools and resources answer from the cache; `server.ensure_fresh` syncs first when it is older than `ZENMONEY_AUTO_SYNC_SECONDS` (default 600). Every tool answer carries `data_synced_at`.
+
+11. **Budget plan** (`_load_budget_plan`): locked row = exact; unlocked row = stored amount + scheduled operations (reminder markers, states planned+processed, first tag, converted); a parent's plan = own + children (ZenMoney stores the parent as the remainder over its children); the month-total row follows the same rule one level up. Deleting a reminder leaves its planned markers in the cache: sync retires them.
 
 ## Tools (18)
 
@@ -112,7 +123,7 @@ After any change:
 pytest tests/ -v --ignore=tests/test_integration.py
 ```
 
-All 175 tests must pass before committing.
+All tests must pass before committing. `tests/test_server.py` drives the server through a real MCP client session; add a test there when a tool's schema or dispatch changes.
 
 ## Common mistakes (avoid)
 

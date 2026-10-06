@@ -74,8 +74,10 @@ class SyncEngine:
             "serverTimestamp": server_timestamp,
         }
 
-        timeout = 300.0 if force_full else 60.0
-        max_attempts = 2 if force_full else 1
+        # An empty cache downloads the whole history, same as a forced full sync
+        full_download = server_timestamp == 0
+        timeout = 300.0 if full_download else 60.0
+        max_attempts = 2 if full_download else 1
 
         async with httpx.AsyncClient() as client:
             last_error = None
@@ -165,6 +167,10 @@ class SyncEngine:
                 count = self.db.delete_by_ids(table_name, [obj_id])
                 if count > 0:
                     deleted[table_name] = deleted.get(table_name, 0) + count
+
+        retired = self.db.retire_orphan_markers()
+        if retired > 0:
+            deleted["reminder_markers"] = deleted.get("reminder_markers", 0) + retired
 
         return {"updated": updated, "deleted": deleted}
 
